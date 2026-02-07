@@ -1,0 +1,14 @@
+# VS Code / Cursor workspace
+*.code-workspace
+
+# Editor directories
+.vscode/
+.cursor/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
