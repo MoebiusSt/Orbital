@@ -10,12 +10,12 @@ An orbital mechanics game where you control a celestial body orbiting a sun. Eje
 
 ## Play
 
-Open `orbital.html` in a browser or try the standalone version at `dist/orbital-mono.html`.
+Open `orbital.html` or the all-in-one standalone build at `dist/orbital-mono.html` in a browser.
 
 **Controls:**
-- Click to eject mass toward cursor (hold for combo multiplier)
-- Scroll to zoom
-- Space to speed up time
+- <kbd>Click</kbd> to eject tiny mass amounts toward cursor to proell yourself (repeat faster clicks to eject more mass for more recoil – conservation of momentum)
+- <kbd>Scroll</kbd> to zoom in and out
+- Hold <kbd>Space</kbd> to speed up time
 
 ## Development
 
@@ -31,4 +31,4 @@ node _build/assemble.js
 - Pure HTML5 Canvas
 - Vanilla JavaScript (no frameworks)
 - Procedural generation (simplex noise, FBM)
-- Keplerian orbit mechanics with dual-mass gravity system
+- Keplerian orbit mechanics with simplified/gemoetric/2D mass gravity system
