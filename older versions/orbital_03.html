@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orbitales Mechanik-Spiel</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+        canvas {
+            display: block;
+            cursor: none; /* Hide default cursor */
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+    <script>
+    // Constants
+    const PLAYER_RADIUS = 15;
+    const SUN_RADIUS = 30;
+    const G = 6.67430e-11 * 0.1;
+    const MASS_EJECTION_RATIO = 0.05;
+    const PLAYER_INITIAL_MASS = 1000;
+    const SUN_MASS = 1e15;
+    const CROSSHAIR_SIZE = 40;
+    const CROSSHAIR_LONG_LINE = 25;
+
+    // Game state
+    let canvas, ctx;
+    let player, sun, ejectedMasses = [];
+    let mouseX = 0, mouseY = 0;
+    let screenMouseX = 0, screenMouseY = 0;
+    let camera = {x: 0, y: 0, scale: 1};
+
+    function initializeGame() {
+        canvas = document.getElementById('gameCanvas');
+        ctx = canvas.getContext('2d');
+        resizeCanvas();
+
+        const ORBIT_RADIUS = Math.min(canvas.width, canvas.height) * 0.35;
+        const ORBITAL_SPEED = Math.sqrt((G * SUN_MASS) / ORBIT_RADIUS);
+
+        player = {
+            x: 0,
+            y: -ORBIT_RADIUS,
+            vx: ORBITAL_SPEED,
+            vy: 0,
+            angle: 0,
+            radius: PLAYER_RADIUS,
+            mass: PLAYER_INITIAL_MASS
+        };
+
+        sun = {
+            x: 0,
+            y: 0,
+            mass: SUN_MASS
+        };
+
+        window.addEventListener('resize', resizeCanvas);
+        canvas.addEventListener('mousemove', updateMousePosition);
+        canvas.addEventListener('click', ejectMass);
+        canvas.addEventListener('wheel', handleZoom);
+    }
+
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    }
+
+    function updateMousePosition(event) {
+        const rect = canvas.getBoundingClientRect();
+        screenMouseX = event.clientX - rect.left;
+        screenMouseY = event.clientY - rect.top;
+        mouseX = (screenMouseX - canvas.width / 2) / camera.scale + camera.x;
+        mouseY = (screenMouseY - canvas.height / 2) / camera.scale + camera.y;
+    }
+
+    function handleZoom(event) {
+        event.preventDefault();
+        const zoomFactor = event.deltaY > 0 ? 0.9 : 1.1;
+        camera.scale *= zoomFactor;
+        camera.scale = Math.max(0.1, Math.min(camera.scale, 5)); // Limit zoom
+    }
+
+    function ejectMass() {
+        const ejectedMass = player.mass * MASS_EJECTION_RATIO;
+        const ejectionSpeed = 2;
+        
+        const dx = mouseX - player.x;
+        const dy = mouseY - player.y;
+        const distance = Math.sqrt(dx*dx + dy*dy);
+        
+        player.vx -= (dx / distance) * ejectionSpeed * ejectedMass / player.mass;
+        player.vy -= (dy / distance) * ejectionSpeed * ejectedMass / player.mass;
+        
+        ejectedMasses.push({
+            x: player.x,
+            y: player.y,
+            vx: (dx / distance) * ejectionSpeed,
+            vy: (dy / distance) * ejectionSpeed,
+            radius: Math.sqrt(ejectedMass / PLAYER_INITIAL_MASS) * PLAYER_RADIUS,
+            lifespan: 100
+        });
+        
+        player.mass -= ejectedMass;
+        player.radius = Math.sqrt(player.mass / PLAYER_INITIAL_MASS) * PLAYER_RADIUS;
+    }
+
+    function updatePhysics() {
+        const dx = sun.x - player.x;
+        const dy = sun.y - player.y;
+        const distanceSquared = dx * dx + dy * dy;
+        const distance = Math.sqrt(distanceSquared);
+        const force = G * player.mass * sun.mass / distanceSquared;
+        const acceleration = force / player.mass;
+        
+        player.vx += acceleration * dx / distance;
+        player.vy += acceleration * dy / distance;
+        
+        player.x += player.vx;
+        player.y += player.vy;
+
+        // Update player angle to point towards the mouse in screen space
+        const playerScreenX = (player.x - camera.x) * camera.scale + canvas.width / 2;
+        const playerScreenY = (player.y - camera.y) * camera.scale + canvas.height / 2;
+        player.angle = Math.atan2(screenMouseY - playerScreenY, screenMouseX - playerScreenX);
+
+        for (let i = ejectedMasses.length - 1; i >= 0; i--) {
+            const mass = ejectedMasses[i];
+            mass.x += mass.vx;
+            mass.y += mass.vy;
+            mass.lifespan--;
+            if (mass.lifespan <= 0) {
+                ejectedMasses.splice(i, 1);
+            }
+        }
+
+        // Update camera position to follow player
+        camera.x = player.x;
+        camera.y = player.y;
+    }
+
+    function drawCrosshair() {
+        const playerScreenX = (player.x - camera.x) * camera.scale + canvas.width / 2;
+        const playerScreenY = (player.y - camera.y) * camera.scale + canvas.height / 2;
+        const crosshairAngle = Math.atan2(screenMouseY - playerScreenY, screenMouseX - playerScreenX);
+        
+        ctx.save();
+        ctx.translate(screenMouseX, screenMouseY);
+        ctx.rotate(crosshairAngle - Math.PI / 2);
+
+        ctx.strokeStyle = 'white';
+        ctx.lineWidth = 2;
+        
+        // Draw four lines
+        for (let i = 0; i < 4; i++) {
+            ctx.rotate(Math.PI / 2);
+            ctx.beginPath();
+            ctx.moveTo(5, 0);
+            const gradient = ctx.createLinearGradient(5, 0, CROSSHAIR_SIZE / 2, 0);
+            gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+            gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+            ctx.strokeStyle = gradient;
+            if (i === 0) {
+                ctx.lineTo(CROSSHAIR_LONG_LINE, 0); // Longer line pointing away from player
+            } else {
+                ctx.lineTo(CROSSHAIR_SIZE / 2.5 - 5, 0);
+            }
+            ctx.stroke();
+        }
+        
+        ctx.restore();
+    }
+	
+	
+
+    function draw() {
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        ctx.save();
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.scale(camera.scale, camera.scale);
+        ctx.translate(-camera.x, -camera.y);
+        
+        ctx.fillStyle = 'yellow';
+        ctx.beginPath();
+        ctx.arc(sun.x, sun.y, SUN_RADIUS, 0, Math.PI * 2);
+        ctx.fill();
+        
+        ctx.fillStyle = 'white';
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, player.radius, 0, Math.PI * 2);
+        ctx.fill();
+        
+        ctx.strokeStyle = 'red';
+        ctx.beginPath();
+        ctx.moveTo(player.x, player.y);
+        ctx.lineTo(
+            player.x + Math.cos(player.angle) * player.radius * 1.5,
+            player.y + Math.sin(player.angle) * player.radius * 1.5
+        );
+        ctx.stroke();
+
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+        for (const mass of ejectedMasses) {
+            ctx.beginPath();
+            ctx.arc(mass.x, mass.y, mass.radius, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        ctx.restore();
+
+        drawCrosshair();
+    }
+
+    function gameLoop() {
+        updatePhysics();
+        draw();
+        requestAnimationFrame(gameLoop);
+    }
+
+    initializeGame();
+    gameLoop();
+    </script>
+</body>
+</html>

@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="de">
+<!--Das Spiel simuliert die Physik orbitaler Mechanik, Massen mit Schwerkfraft als Attraktoren und Beschleunigung von Körpern im freien Fall durch Ausstoß und Rückstoß von Masse. Das Spiel zeigt eine schwarze Fläche und als Avatar des Spielers, im folgenden Spieler genannt, einen Kreis mit einer richtungsmarkierenden Linie. Der Spieler kann seinen Ausrichtung mit der Maus drehen. Die Ausrichtung der Spitze des Spielers zeigt immer in Richtung Mauszeiger. Außerdem gibt es in der Fläche einen massereiche Körper, im folgenden Sonnen genannt, dargestellt durch einen größeren  Kreis. Diese Massekörper/Sonne hat Schwerkraft, funktioniert also als Attraktoren mit einem anziehenden Gradienten welche den Spieler anziehen.  Der Spieler befindet sich zu Spielbeginn in einer stabilen Kreisbahn, einen Orbit, um eine Sonne. Der Spieler kann nun durch Mausklick, einen Teil seiner eigenen Masse auswerfen, sagen wir 5% seines Volumens, dargestellt durch einen kleineren Kreis welcher 5% der Fläche des Spielerkreises entspricht, der sich vom Spieler ausgestoßen in die entgegengesetze Richtung des Spielers nach hinten entfernt. Entsprechend des Rückstoßprinzips wird der Spieler dadurch in die entgegengesetzte Richtung nach Vorne beschleunigt und ändert seine Kreisbahn im Orbit um die massereichen Attraktoren. Außerdem wird der Spieler bei jedem Masseausstoß um 5% kleiner. Die Umlaufbahn des Spielers wird kenntlich gemacht als feine, leicht durchsichtige Ellipse der Bahn auf der sich der Spieler befindet. Die Ellipse wird so erzeugt, daß sich in Ihrem Brennpunkt die Sonne befindet und die Ellipsenbahn durch die Position des Spielers verläuft. Die bei jedem Massenausstoß neu zu berechnenede Orbitalparamter wird an ein Array aus Kreisbahnen übergeben damit sich 20 Geschichtsstaten der letzten Kreisbahnen bilden. Die älteste Kreisbahn wird dann immer aus dem Array entfernt und durch die neueste Kreisbahn ersetzt. Die Funktion der Umlaufbahn führt auch eine Kollisionsabfrage durch, die überprüft ob die Umlaufbahn die Fläche der Sonne schneidet. In dem das Fall, daß die Flugbahn die Sonne berührt soll die Umlaufbahn in der Farbe Rot gerendert werden, ansonsten in Hellblau. Das Array der letzten 10 Kreisbahn-Bezierkurven wird mit je 10% Opazität übereinander geblendet dargestellt, die neueste Kreisbahn zuoberst.-->
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orbitales Mechanik-Spiel</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+        canvas {
+            display: block;
+            cursor: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+    <script>
+    // Constants
+    const PLAYER_RADIUS = 15;
+    const SUN_RADIUS = 30;
+    const G = 6.67430e-11 * 0.1;
+    const MASS_EJECTION_RATIO = 0.1;
+    const PLAYER_INITIAL_MASS = 1000;
+    const SUN_MASS = 1e14;
+    const CROSSHAIR_SIZE = 40;
+    const CROSSHAIR_LONG_LINE = 25;
+    const ORBIT_HISTORY_LENGTH = 30;
+
+    // Game state
+    let canvas, ctx;
+    let player, sun, ejectedMasses = [];
+    let mouseX = 0, mouseY = 0;
+    let screenMouseX = 0, screenMouseY = 0;
+    let camera = {x: 0, y: 0, scale: 1};
+    let orbitHistory = [];
+
+    function initializeGame() {
+        canvas = document.getElementById('gameCanvas');
+        ctx = canvas.getContext('2d');
+        resizeCanvas();
+
+        const ORBIT_RADIUS = Math.min(canvas.width, canvas.height) * 0.35;
+        const ORBITAL_SPEED = Math.sqrt((G * SUN_MASS) / ORBIT_RADIUS);
+
+        player = {
+            x: 0,
+            y: -ORBIT_RADIUS,
+            vx: ORBITAL_SPEED,
+            vy: 0,
+            angle: 0,
+            radius: PLAYER_RADIUS,
+            mass: PLAYER_INITIAL_MASS
+        };
+
+        sun = {
+            x: 0,
+            y: 0,
+            mass: SUN_MASS
+        };
+
+        window.addEventListener('resize', resizeCanvas);
+        canvas.addEventListener('mousemove', updateMousePosition);
+        canvas.addEventListener('click', ejectMass);
+        canvas.addEventListener('wheel', handleZoom);
+    }
+
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    }
+
+    function updateMousePosition(event) {
+        const rect = canvas.getBoundingClientRect();
+        screenMouseX = event.clientX - rect.left;
+        screenMouseY = event.clientY - rect.top;
+        mouseX = (screenMouseX - canvas.width / 2) / camera.scale + camera.x;
+        mouseY = (screenMouseY - canvas.height / 2) / camera.scale + camera.y;
+    }
+
+    function handleZoom(event) {
+        event.preventDefault();
+        const zoomFactor = event.deltaY > 0 ? 0.9 : 1.1;
+        camera.scale *= zoomFactor;
+        camera.scale = Math.max(0.1, Math.min(camera.scale, 5));
+    }
+
+    function ejectMass() {
+        const ejectedMass = player.mass * MASS_EJECTION_RATIO;
+        const ejectionSpeed = 2;
+        
+        const dx = mouseX - player.x;
+        const dy = mouseY - player.y;
+        const distance = Math.sqrt(dx*dx + dy*dy);
+        
+        player.vx -= (dx / distance) * ejectionSpeed * ejectedMass / player.mass;
+        player.vy -= (dy / distance) * ejectionSpeed * ejectedMass / player.mass;
+        
+        ejectedMasses.push({
+            x: player.x,
+            y: player.y,
+            vx: (dx / distance) * ejectionSpeed,
+            vy: (dy / distance) * ejectionSpeed,
+            radius: Math.sqrt(ejectedMass / PLAYER_INITIAL_MASS) * PLAYER_RADIUS,
+            lifespan: 100
+        });
+        
+        player.mass -= ejectedMass;
+        player.radius = Math.sqrt(player.mass / PLAYER_INITIAL_MASS) * PLAYER_RADIUS;
+    }
+
+    function updatePhysics() {
+        const dx = sun.x - player.x;
+        const dy = sun.y - player.y;
+        const distanceSquared = dx * dx + dy * dy;
+        const distance = Math.sqrt(distanceSquared);
+        const force = G * player.mass * sun.mass / distanceSquared;
+        const acceleration = force / player.mass;
+        
+        player.vx += acceleration * dx / distance;
+        player.vy += acceleration * dy / distance;
+        
+        player.x += player.vx;
+        player.y += player.vy;
+
+        const playerScreenX = (player.x - camera.x) * camera.scale + canvas.width / 2;
+        const playerScreenY = (player.y - camera.y) * camera.scale + canvas.height / 2;
+        player.angle = Math.atan2(screenMouseY - playerScreenY, screenMouseX - playerScreenX);
+
+        for (let i = ejectedMasses.length - 1; i >= 0; i--) {
+            const mass = ejectedMasses[i];
+            mass.x += mass.vx;
+            mass.y += mass.vy;
+            mass.lifespan--;
+            if (mass.lifespan <= 0) {
+                ejectedMasses.splice(i, 1);
+            }
+        }
+
+        camera.x = player.x;
+        camera.y = player.y;
+
+        updateOrbitHistory();
+    }
+    
+     
+    function calculateOrbitParameters() {
+        const mu = G * (sun.mass + player.mass);
+        const rx = player.x - sun.x;
+        const ry = player.y - sun.y;
+        const r = Math.sqrt(rx * rx + ry * ry);
+        const v = Math.sqrt(player.vx * player.vx + player.vy * player.vy);
+        
+        const energy = v * v / 2 - mu / r;
+        const a = -mu / (2 * energy);
+        
+        const h = rx * player.vy - ry * player.vx;
+        const p = h * h / mu;
+        const e = Math.sqrt(1 - p / a);
+        
+        const b = a * Math.sqrt(1 - e * e);
+        
+        // Calculate eccentricity vector
+        const ex = ((v * v - mu / r) * rx - (rx * player.vx + ry * player.vy) * player.vx) / mu;
+        const ey = ((v * v - mu / r) * ry - (rx * player.vx + ry * player.vy) * player.vy) / mu;
+
+        // Calculate true anomaly
+        let trueAnomaly = Math.atan2(h * ry, h * rx - mu * r);
+        if (trueAnomaly < 0) {
+            trueAnomaly += 2 * Math.PI;
+        }
+
+        // Calculate the angle of periapsis
+        const periapsisAngle = Math.atan2(ey, ex);
+        
+        // Check for collision with the sun
+        const periapsis = a * (1 - e);
+        const collidesSun = periapsis <= SUN_RADIUS;
+
+        return { a, b, e, trueAnomaly, periapsisAngle, collides: collidesSun };
+    }
+
+    
+    function drawEllipse(ctx, sunX, sunY, a, b, e, periapsisAngle) {
+        ctx.save();
+        ctx.translate(sunX, sunY);
+        ctx.rotate(periapsisAngle);
+        
+        ctx.beginPath();
+        ctx.ellipse(-e * a * camera.scale, 0, a * camera.scale, b * camera.scale, 0, 0, 2 * Math.PI);
+        
+        ctx.restore();
+    }
+    
+    
+    function updateOrbitHistory() {
+        const orbitParams = calculateOrbitParameters();
+        orbitHistory.unshift(orbitParams);
+        if (orbitHistory.length > ORBIT_HISTORY_LENGTH) {
+            orbitHistory.pop();
+        }
+    }
+    
+
+    function drawCrosshair() {
+        const playerScreenX = (player.x - camera.x) * camera.scale + canvas.width / 2;
+        const playerScreenY = (player.y - camera.y) * camera.scale + canvas.height / 2;
+        const crosshairAngle = Math.atan2(screenMouseY - playerScreenY, screenMouseX - playerScreenX);
+        
+        ctx.save();
+        ctx.translate(screenMouseX, screenMouseY);
+        ctx.rotate(crosshairAngle - Math.PI / 2);
+        ctx.strokeStyle = 'white';
+        ctx.lineWidth = 2;
+        
+        // Draw four lines
+        for (let i = 0; i < 4; i++) {
+            ctx.rotate(Math.PI / 2);
+            ctx.beginPath();
+            ctx.moveTo(5, 0);
+            const gradient = ctx.createLinearGradient(5, 0, CROSSHAIR_SIZE / 2, 0);
+            gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+            gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+            ctx.strokeStyle = gradient;
+            if (i === 0) {
+                ctx.lineTo(CROSSHAIR_LONG_LINE, 0); // Longer line pointing away from player
+            } else {
+                ctx.lineTo(CROSSHAIR_SIZE / 2.5 - 5, 0);
+            }
+            ctx.stroke();
+        }
+        
+        ctx.restore();
+    }
+
+
+    function drawOrbitHistory() {
+        ctx.save();
+        orbitHistory.forEach((orbit, index) => {
+            drawEllipse(ctx, sun.x, sun.y, orbit.a, orbit.b, orbit.e, orbit.periapsisAngle);
+            ctx.strokeStyle = orbit.collides ? `rgba(255, 0, 0, ${0.1 * (ORBIT_HISTORY_LENGTH - index) / ORBIT_HISTORY_LENGTH})` 
+                                             : `rgba(173, 216, 230, ${0.1 * (ORBIT_HISTORY_LENGTH - index) / ORBIT_HISTORY_LENGTH})`;
+            ctx.stroke();
+        });
+        ctx.restore();
+    }
+
+    function draw() {
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        ctx.save();
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.scale(camera.scale, camera.scale);
+        ctx.translate(-camera.x, -camera.y);
+        
+        drawOrbitHistory();
+
+        ctx.fillStyle = 'yellow';
+        ctx.beginPath();
+        ctx.arc(sun.x, sun.y, SUN_RADIUS, 0, Math.PI * 2);
+        ctx.fill();
+        
+        ctx.fillStyle = 'white';
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, player.radius, 0, Math.PI * 2);
+        ctx.fill();
+        
+        ctx.strokeStyle = 'red';
+        ctx.beginPath();
+        ctx.moveTo(player.x, player.y);
+        ctx.lineTo(
+            player.x + Math.cos(player.angle) * player.radius * 1.5,
+            player.y + Math.sin(player.angle) * player.radius * 1.5
+        );
+        ctx.stroke();
+
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+        for (const mass of ejectedMasses) {
+            ctx.beginPath();
+            ctx.arc(mass.x, mass.y, mass.radius, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        ctx.restore();
+
+        drawCrosshair();
+    }
+
+    function gameLoop() {
+        updatePhysics();
+        draw();
+        requestAnimationFrame(gameLoop);
+    }
+
+    initializeGame();
+    gameLoop();
+    </script>
+</body>
+</html>

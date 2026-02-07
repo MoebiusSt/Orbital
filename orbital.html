@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orbitales Mechanik-Spiel</title>
+    <link rel="stylesheet" href="assets/orbital.css">
+</head>
+<body>
+    <canvas id="coronaCanvas"></canvas>
+    <div class="sun-blur sun-blur-corona" aria-hidden="true"></div>
+    <canvas id="sunCanvas"></canvas>
+    <div class="sun-blur sun-blur-disk" aria-hidden="true"></div>
+    <canvas id="gameCanvas"></canvas>
+
+    <!-- 
+        MODULAR JS LOAD ORDER
+        See ARCHITECTURE.md for full documentation.
+        For monolithic build, run: node build/assemble.js
+    -->
+    <script src="assets/js/constants.js"></script>
+    <script src="assets/js/utils.js"></script>
+    <script src="assets/js/state.js"></script>
+    <script src="assets/js/noise.js"></script>
+    <script src="assets/js/background.js"></script>
+    <script src="assets/js/sun-visuals.js"></script>
+    <script src="assets/js/body-rendering.js"></script>
+    <script src="assets/js/celestial-body.js"></script>
+    <script src="assets/js/input.js"></script>
+    <script src="assets/js/population.js"></script>
+    <script src="assets/js/ejection.js"></script>
+    <script src="assets/js/physics.js"></script>
+    <script src="assets/js/collision.js"></script>
+    <script src="assets/js/absorption.js"></script>
+    <script src="assets/js/game-state.js"></script>
+    <script src="assets/js/renderer.js"></script>
+    <script src="assets/js/main.js"></script>
+</body>
+</html>

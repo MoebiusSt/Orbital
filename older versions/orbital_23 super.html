@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orbitales Mechanik-Spiel</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+        canvas {
+            display: block;
+            cursor: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+<script>
+// Constants
+const PLAYER_RADIUS = 30;
+const DENSITY = 1000;
+
+const SUN_RADIUS = 120;
+const SUN_MASS = 1e20;
+const G = 6.67430e-11 * 0.1;
+
+const PLAYER_INITIAL_MASS = calculateMassFromRadius(PLAYER_RADIUS);
+const MIN_PLAYER_MASS = PLAYER_INITIAL_MASS * 0.1;
+
+const INIT_NUM_BODIES = 400
+
+const CROSSHAIR_SIZE = 40;
+const CROSSHAIR_LONG_LINE = 25;
+const ORBIT_HISTORY_LENGTH = 90;
+
+const BASE_EJECTION_AMOUNT = PLAYER_INITIAL_MASS * 0.0005;
+const MAX_EJECTION_MULTIPLIER = 85;
+const EJECTION_GROWTH_RATE = 3;
+
+const QUICK_CLICK_THRESHOLD = 260;
+const MAX_EJECTION_PERCENTAGE = 0.5;
+
+const EJECTION_BASE_SPEED = 800;
+const EJECTEDMASS_LIFESPAN = 10000;
+const EJECTION_PROPULSION_MULTIPLIER = 45;
+
+const EJECTION_DECAY_RATE = 0.97;
+const EJECTION_DECAY_INTERVAL = 300;
+
+const MASS_TRANSFER_PERCENT_PER_SEC = 4.0;
+const EJECTION_COLLISION_DELAY = 300;
+
+const BASE_GAME_SPEED = 0.1; // Sehr langsam
+const FAST_GAME_SPEED = 1.0; // Normale Geschwindigkeit
+let currentGameSpeed = BASE_GAME_SPEED;
+
+// **NEW:** Trail Fading Constants
+const TRAIL_FADE_IN_RATE = 0.6; // Opacity units per second
+const TRAIL_FADE_OUT_RATE = 0.3; // Opacity units per second
+const TRAIL_PROXIMITY_FACTOR = 5; // Multiplier for player diameter
+
+// Globale Variablen für das Logging
+let lastLogTime = 0;
+const LOG_INTERVAL = 5000;
+let bodyStates = new Map();
+let gameWon = false;
+let collisionDetectedThisFrame = false;
+let playerNeedsReset = false;
+
+class CelestialBody {
+    constructor(x, y, vx, vy, mass, isPlayer = false, isSun = false) {
+        this.x = x;
+        this.y = y;
+        this.vx = vx;
+        this.vy = vy;
+        this._mass = mass;
+        this.isPlayer = isPlayer;
+        this.isSun = isSun;
+        this.creationTime = Date.now();
+        this.angle = 0;
+        this._radius = this.isSun ? SUN_RADIUS : calculateRadiusFromMass(mass);
+        this.id = (isPlayer ? 'P' : isSun ? 'S' : 'M') + this.creationTime + Math.random().toString(16).substring(2, 6);
+
+        // Orbit parameters
+        this.orbitA = 0;
+        this.orbitB = 0;
+        this.orbitE = 0;
+        this.orbitPeriapsisAngle = 0;
+        this.orbitCollidesSun = false;
+
+        // **NEW:** Trail Opacity State
+        this.trailOpacity = 0; // Start fully faded out
+    }
+
+    get mass() {
+        return this._mass;
+    }
+
+    set mass(newMass) {
+        this._mass = Math.max(0, newMass);
+        if (!this.isSun) {
+            this._radius = calculateRadiusFromMass(this._mass);
+        } else {
+            this._radius = SUN_RADIUS;
+        }
+    }
+
+    get radius() {
+        return Math.max(0.1, this.isSun ? SUN_RADIUS : this._radius);
+    }
+}
+
+
+// Game state
+let canvas, ctx;
+let mouseX = 0, mouseY = 0;
+let screenMouseX = 0, screenMouseY = 0;
+let camera = {x: 0, y: 0, scale: 1};
+let orbitHistory = [];
+
+let lastClickTime = 0;
+let lastEjectionDecayTime = 0;
+let currentEjectionMultiplier = 1;
+let currentWarningIntensity = 0;
+
+let celestialBodies = [];
+
+
+function initializeGame() {
+    canvas = document.getElementById('gameCanvas');
+    ctx = canvas.getContext('2d');
+    resizeCanvas();
+
+    celestialBodies = [
+        new CelestialBody(0, 0, 0, 0, SUN_MASS, false, true), // Sonne
+        new CelestialBody(0, -Math.min(canvas.width, canvas.height) * 0.35, Math.sqrt((G * SUN_MASS) / (Math.min(canvas.width, canvas.height) * 0.35)), 0, PLAYER_INITIAL_MASS, true) // Spieler
+    ];
+
+    populateSystem(INIT_NUM_BODIES); // Mehr Massen, inkl. größerer
+
+    window.addEventListener('resize', resizeCanvas);
+    canvas.addEventListener('mousemove', updateMousePosition);
+    canvas.addEventListener('click', ejectMass);
+    canvas.addEventListener('wheel', handleZoom);
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+}
+
+function handleKeyDown(event) {
+    if (event.code === 'Space') {
+        currentGameSpeed = FAST_GAME_SPEED;
+    }
+}
+
+function handleKeyUp(event) {
+    if (event.code === 'Space') {
+        currentGameSpeed = BASE_GAME_SPEED;
+    }
+}
+
+
+function populateSystem(numMasses) {
+    const sun = celestialBodies.find(b => b.isSun);
+    if (!sun) return;
+
+    console.log(`Populating with ${numMasses} bodies...`);
+    let largerCount = 0;
+
+    for (let i = 0; i < numMasses; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const distance = SUN_RADIUS * 3 + Math.random() * SUN_RADIUS * 12;
+        const x = sun.x + Math.cos(angle) * distance;
+        const y = sun.y + Math.sin(angle) * distance;
+
+        const orbitalSpeed = Math.sqrt((G * sun.mass) / distance);
+        const speedFactor = 0.9 + Math.random() * 0.2;
+        const vx = -Math.sin(angle) * orbitalSpeed * speedFactor;
+        const vy = Math.cos(angle) * orbitalSpeed * speedFactor;
+
+        const rand = Math.random();
+        let mass;
+        if (rand < 0.7) { // 70% small
+            mass = PLAYER_INITIAL_MASS * (0.02 + Math.random() * 0.2);
+        } else if (rand < 0.9) { // 20% medium
+             mass = PLAYER_INITIAL_MASS * (0.4 + Math.random() * 0.5);
+        } else { // 10% large
+            mass = PLAYER_INITIAL_MASS * (1.1 + Math.random() * 1.4);
+            largerCount++;
+        }
+
+        celestialBodies.push(new CelestialBody(x, y, vx, vy, mass));
+    }
+     console.log(`Created ${largerCount} bodies larger than initial player mass.`);
+}
+
+
+function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+
+
+function updateMousePosition(event) {
+    const rect = canvas.getBoundingClientRect();
+    screenMouseX = event.clientX - rect.left;
+    screenMouseY = event.clientY - rect.top;
+    mouseX = (screenMouseX - canvas.width / 2) / camera.scale + camera.x;
+    mouseY = (screenMouseY - canvas.height / 2) / camera.scale + camera.y;
+}
+
+
+function handleZoom(event) {
+    event.preventDefault();
+    const zoomFactor = event.deltaY > 0 ? 0.9 : 1.1;
+    camera.scale *= zoomFactor;
+    camera.scale = Math.max(0.05, Math.min(camera.scale, 5));
+}
+
+
+function calculateRadiusFromMass(mass) {
+    if (mass <= 0) return 0.1;
+    const volume = mass / DENSITY;
+    return Math.cbrt((3 * volume) / (4 * Math.PI));
+}
+
+
+function calculateMassFromRadius(radius) {
+    return (4/3) * Math.PI * Math.pow(radius, 3) * DENSITY;
+}
+
+
+function ejectMass() {
+    const player = celestialBodies.find(b => b.isPlayer);
+    if (!player || player.mass <= MIN_PLAYER_MASS) return;
+
+    const currentTime = Date.now();
+    const timeSinceLastClick = currentTime - lastClickTime;
+
+    if (player.mass <= MIN_PLAYER_MASS) return;
+
+    if (timeSinceLastClick <= QUICK_CLICK_THRESHOLD) {
+        currentEjectionMultiplier = Math.min(currentEjectionMultiplier * EJECTION_GROWTH_RATE, MAX_EJECTION_MULTIPLIER);
+    } else {
+        currentEjectionMultiplier = 1;
+    }
+
+    const ejectionAmount = BASE_EJECTION_AMOUNT * currentEjectionMultiplier;
+    const maxEjection = player.mass * MAX_EJECTION_PERCENTAGE;
+    let ejectedMass = Math.min(ejectionAmount, maxEjection);
+
+    if (player.mass - ejectedMass < MIN_PLAYER_MASS ) {
+        ejectedMass = player.mass - MIN_PLAYER_MASS;
+        if (ejectedMass <= 1e-9) return;
+    }
+    player.mass -= ejectedMass;
+
+
+    const ejectionSpeed = EJECTION_BASE_SPEED * Math.sqrt(BASE_EJECTION_AMOUNT / ejectedMass);
+    const dx = mouseX - player.x;
+    const dy = mouseY - player.y;
+    const distance = Math.sqrt(dx*dx + dy*dy) || 1;
+
+    const startDistOffset = player.radius + calculateRadiusFromMass(ejectedMass) * 1.1;
+    const ejectionStartX = player.x + (dx / distance) * startDistOffset;
+    const ejectionStartY = player.y + (dy / distance) * startDistOffset;
+
+
+    const ejectedBody = new CelestialBody(
+        ejectionStartX,
+        ejectionStartY,
+        player.vx + (dx / distance) * ejectionSpeed,
+        player.vy + (dy / distance) * ejectionSpeed,
+        ejectedMass
+    );
+    ejectedBody.creationTime = Date.now();
+
+    celestialBodies.push(ejectedBody);
+
+
+    if (player.mass > 0) {
+        const impulse = ejectedMass * ejectionSpeed;
+        let playerImpulse = impulse / player.mass;
+        playerImpulse *= EJECTION_PROPULSION_MULTIPLIER;
+        player.vx -= (dx / distance) * playerImpulse;
+        player.vy -= (dy / distance) * playerImpulse;
+    } else {
+         console.error("Player mass is zero or less during ejection impulse calculation!");
+    }
+
+    lastClickTime = currentTime;
+}
+
+
+function updatePhysics(dt) {
+    const gameDeltaTime = dt * currentGameSpeed;
+    collisionDetectedThisFrame = false;
+    playerNeedsReset = false; // Reset flag at start of frame
+
+    // 1. Calculate Sun's Gravity
+    const sun = celestialBodies.find(b => b.isSun);
+    if (sun && sun.mass > 0) {
+        for (let i = 0; i < celestialBodies.length; i++) {
+            const body = celestialBodies[i];
+            if (!body || body.isSun || body.mass <= 0) continue;
+
+            const dx_sun = sun.x - body.x;
+            const dy_sun = sun.y - body.y;
+            const distSq_sun = dx_sun * dx_sun + dy_sun * dy_sun;
+            const dist_sun = Math.sqrt(distSq_sun);
+
+             if (dist_sun > 0) {
+                 const force_sun = G * body.mass * sun.mass / distSq_sun;
+                 const acc_sun = force_sun / body.mass;
+                 body.vx += acc_sun * dx_sun / dist_sun * gameDeltaTime;
+                 body.vy += acc_sun * dy_sun / dist_sun * gameDeltaTime;
+             }
+        }
+    }
+
+    // 2. Update Positions
+    for(let body of celestialBodies) {
+        if (!body || body.isSun) continue;
+
+        // Cap velocity
+        const MAX_VELOCITY = 10000;
+        const currentSpeedSq = body.vx*body.vx + body.vy*body.vy;
+        if (currentSpeedSq > MAX_VELOCITY * MAX_VELOCITY) {
+            const currentSpeed = Math.sqrt(currentSpeedSq);
+            const factor = MAX_VELOCITY / currentSpeed;
+            body.vx *= factor;
+            body.vy *= factor;
+        }
+
+        body.x += body.vx * gameDeltaTime;
+        body.y += body.vy * gameDeltaTime;
+
+        // Update player angle
+        if (body.isPlayer) {
+            const playerScreenX = (body.x - camera.x) * camera.scale + canvas.width / 2;
+            const playerScreenY = (body.y - camera.y) * camera.scale + canvas.height / 2;
+            body.angle = Math.atan2(screenMouseY - playerScreenY, screenMouseX - playerScreenX);
+        }
+    }
+
+    // 3. Check Collisions & Mass Transfer
+    checkCollisionsAndTransferMass_Backward(dt); // Pass REAL dt
+
+    // Handle reset *after* collision loop
+    if (playerNeedsReset) {
+        resetPlayer();
+        return; // Abort rest of physics update for this frame
+    }
+
+    // 4. Calculate Orbit Parameters and Update Trail Opacity
+    const sunForOrbitCalc = celestialBodies.find(b => b.isSun);
+    const playerForProximityCheck = celestialBodies.find(b => b.isPlayer); // Find player once
+
+    if (sunForOrbitCalc) {
+        const maxDistanceSq = playerForProximityCheck ? Math.pow(playerForProximityCheck.radius * 1.25 * TRAIL_PROXIMITY_FACTOR, 2) : -1; // Calculate max distance squared, -1 if no player, *mult 1.25 to look less far the bigger player gets
+
+        for (let body of celestialBodies) {
+            if (!body || body.isSun || body.mass <= 0) continue;
+
+            // Calculate Orbit Params
+            const params = calculateOrbitParameters(body, sunForOrbitCalc);
+            body.orbitA = params.a;
+            body.orbitB = params.b;
+            body.orbitE = params.e;
+            body.orbitPeriapsisAngle = params.periapsisAngle;
+            body.orbitCollidesSun = params.collidesSun;
+
+            // **NEW:** Update Trail Opacity
+            if (!body.isPlayer) {
+                let targetOpacity = 0.0;
+                if (playerForProximityCheck && maxDistanceSq > 0) {
+                    const dx = body.x - playerForProximityCheck.x;
+                    const dy = body.y - playerForProximityCheck.y;
+                    const distanceToPlayerSq = dx*dx + dy*dy;
+                    if (distanceToPlayerSq <= maxDistanceSq) {
+                        targetOpacity = 1.0; // Close enough, target full opacity
+                    }
+                }
+
+                const fadeRate = (targetOpacity > body.trailOpacity) ? TRAIL_FADE_IN_RATE : TRAIL_FADE_OUT_RATE;
+                const opacityChange = fadeRate * dt; // Use REAL dt for smooth fading
+
+                if (targetOpacity > body.trailOpacity) {
+                    body.trailOpacity = Math.min(targetOpacity, body.trailOpacity + opacityChange);
+                } else if (targetOpacity < body.trailOpacity) {
+                    body.trailOpacity = Math.max(targetOpacity, body.trailOpacity - opacityChange);
+                }
+                 // Clamp just in case
+                body.trailOpacity = Math.max(0, Math.min(1, body.trailOpacity));
+            }
+        }
+    }
+
+
+    // 5. Update Camera, UI, etc.
+    const player = playerForProximityCheck; // Reuse player object if found
+    if (player) {
+        camera.x = player.x;
+        camera.y = player.y;
+    } else if (!gameWon) {
+        // Handle case where player might disappear unexpectedly without reset flag
+        console.error("Player object not found during camera update, initiating reset.");
+        resetPlayer();
+        return;
+    }
+
+
+    const targetWarningIntensity = calculateWarningIntensity();
+    currentWarningIntensity = interpolateWarningIntensity(targetWarningIntensity, dt); // Use REAL dt
+
+    updateOrbitHistory();
+    decayEjectionMultiplier();
+    checkWinCondition();
+
+     // if (collisionDetectedThisFrame) { console.log("Collision detected."); }
+}
+
+
+function decayEjectionMultiplier() {
+    const currentTime = Date.now();
+    if (currentTime - lastClickTime > QUICK_CLICK_THRESHOLD && currentTime - lastEjectionDecayTime > EJECTION_DECAY_INTERVAL) {
+        currentEjectionMultiplier = Math.max(1, currentEjectionMultiplier * EJECTION_DECAY_RATE);
+        lastEjectionDecayTime = currentTime;
+    }
+}
+
+
+function calculateOrbitParameters(body, sun) {
+    if (!sun || body.mass <= 0 || sun.mass <=0) return { a: 0, b: 0, e: 0, trueAnomaly: 0, periapsisAngle: 0, collidesSun: false };
+
+    const rx = body.x - sun.x;
+    const ry = body.y - sun.y;
+    const r_vec_sq = rx * rx + ry * ry;
+    const r = Math.sqrt(r_vec_sq);
+
+    const vx = body.vx;
+    const vy = body.vy;
+    const v_vec_sq = vx * vx + vy * vy;
+
+    const r_vec_dot_v_vec = rx * vx + ry * vy;
+
+    const mu = G * (sun.mass + body.mass);
+
+    const E = v_vec_sq / 2 - mu / r;
+
+    if (E >= 0 || !isFinite(E)) {
+        return { a: Infinity, b: Infinity, e: 1, trueAnomaly: 0, periapsisAngle: 0, collidesSun: false };
+    }
+
+    const a = -mu / (2 * E);
+    if (!isFinite(a) || a <= 0) {
+       return { a: Infinity, b: Infinity, e: 1, trueAnomaly: 0, periapsisAngle: 0, collidesSun: false };
+    }
+
+    const h = rx * vy - ry * vx; // Specific angular momentum magnitude
+    if (mu === 0) return { a: 0, b: 0, e: 0, trueAnomaly: 0, periapsisAngle: 0, collidesSun: false };
+    const p = h * h / mu; // Semi-latus rectum
+    const eSquared = 1 - p / a;
+    const e = eSquared > 0 ? Math.sqrt(eSquared) : 0;
+
+    const b = a * Math.sqrt(Math.max(0, 1 - e * e));
+
+    // Eccentricity vector components calculation needs valid mu
+    const mu_inv = 1 / mu;
+    const r_inv = 1 / r;
+    const v_sq = v_vec_sq; // Use already calculated square
+
+    const factor = (v_sq * mu_inv - r_inv); // This factor is correct
+
+    const ex = (factor * rx - r_vec_dot_v_vec * vx * mu_inv);
+    const ey = (factor * ry - r_vec_dot_v_vec * vy * mu_inv);
+
+    // Re-calculate eccentricity magnitude from vector for consistency
+    const e_from_vec = Math.sqrt(ex*ex + ey*ey);
+    // Use the magnitude calculated from the vector if it's valid
+    const effective_e = isFinite(e_from_vec) ? e_from_vec : e;
+
+
+    const periapsisAngle = Math.atan2(ey, ex);
+
+    const cosP = Math.cos(periapsisAngle);
+    const sinP = Math.sin(periapsisAngle);
+    const r_proj_e = rx * cosP + ry * sinP;
+    const r_proj_perp = -rx * sinP + ry * cosP;
+    let trueAnomaly = Math.atan2(r_proj_perp, r_proj_e);
+
+    if (trueAnomaly < 0) trueAnomaly += 2 * Math.PI;
+
+    const periapsisDist = a * (1 - effective_e);
+    const collidesSun = periapsisDist <= (SUN_RADIUS + body.radius);
+
+    return { a, b, e: effective_e, trueAnomaly, periapsisAngle, collidesSun };
+}
+
+
+function checkCollisionsAndTransferMass_Backward(dt) {
+    // No gameDeltaTime needed here, transfer uses real dt now
+    for (let i = celestialBodies.length - 1; i >= 0; i--) {
+        if (!celestialBodies[i]) continue;
+        const body1 = celestialBodies[i];
+        if (body1.mass <= 0) continue;
+
+        for (let j = i - 1; j >= 0; j--) {
+            if (!celestialBodies[j]) continue;
+            const body2 = celestialBodies[j];
+            if (body2.mass <= 0) continue;
+
+            const age1 = Date.now() - body1.creationTime;
+            const age2 = Date.now() - body2.creationTime;
+             if (!body1.isSun && !body2.isSun) {
+                 if ((body1.isPlayer && age2 < EJECTION_COLLISION_DELAY) ||
+                     (body2.isPlayer && age1 < EJECTION_COLLISION_DELAY)) {
+                     continue;
+                 }
+                 if (age1 < EJECTION_COLLISION_DELAY && age2 < EJECTION_COLLISION_DELAY) {
+                     continue;
+                 }
+             }
+
+            const dx = body2.x - body1.x;
+            const dy = body2.y - body1.y;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            const combinedRadii = body1.radius + body2.radius;
+
+            if (distance < combinedRadii) {
+                collisionDetectedThisFrame = true;
+
+                let biggerBody, smallerBody;
+                let biggerIndex, smallerIndex;
+
+                if (body1.mass >= body2.mass) {
+                    biggerBody = body1; biggerIndex = i;
+                    smallerBody = body2; smallerIndex = j;
+                } else {
+                    biggerBody = body2; biggerIndex = j;
+                    smallerBody = body1; smallerIndex = i;
+                }
+
+                 let transferAmount = smallerBody.mass * MASS_TRANSFER_PERCENT_PER_SEC * dt; // Use REAL dt
+                 transferAmount = Math.min(transferAmount, smallerBody.mass);
+
+                // Apply transfer
+                biggerBody.mass += transferAmount;
+                smallerBody.mass -= transferAmount;
+
+                // Check if player died
+                if (smallerBody.isPlayer && smallerBody.mass < MIN_PLAYER_MASS) {
+                    console.log("Player mass below minimum, setting reset flag.");
+                    playerNeedsReset = true; // Set flag instead of calling reset
+                    return; // Exit collision check loops immediately
+                }
+
+                // Remove smaller body if mass depleted
+                 if (smallerBody.mass <= 1e-9) {
+                     // Ensure any fading trail is also removed visually
+                     smallerBody.trailOpacity = 0;
+                     celestialBodies.splice(smallerIndex, 1);
+                     // Adjust outer loop index since we removed an element
+                     if (biggerIndex > smallerIndex) biggerIndex--;
+                     i = biggerIndex; // Make sure the outer loop doesn't skip the next body
+                     // No need to `continue` inner loop, j is already correct
+                 }
+             }
+        }
+    }
+}
+
+
+function drawEllipse(ctx, sunX, sunY, a, b, e, periapsisAngle) {
+    if (!isFinite(a) || !isFinite(b) || a <= 0 || b <= 0) return false; // Indicate failure
+
+    ctx.save();
+    const scaledSunX = (sunX - camera.x) * camera.scale + canvas.width / 2;
+    const scaledSunY = (sunY - camera.y) * camera.scale + canvas.height / 2;
+
+    ctx.translate(scaledSunX, scaledSunY);
+    ctx.rotate(periapsisAngle);
+
+    const scaledA = a * camera.scale;
+    const scaledB = b * camera.scale;
+    const scaledC = e * a * camera.scale;
+
+    const maxDim = Math.max(canvas.width, canvas.height) * 10;
+    if (scaledA > maxDim || scaledB > maxDim || scaledA < 0.1 || scaledB < 0.1) {
+       ctx.restore();
+       return false; // Indicate failure
+    }
+
+    ctx.beginPath(); // Start new path for this ellipse
+    try {
+        if (isFinite(scaledA) && isFinite(scaledB) && scaledA > 0 && scaledB > 0 && isFinite(scaledC)) {
+             ctx.ellipse(-scaledC, 0, scaledA, scaledB, 0, 0, 2 * Math.PI);
+        } else {
+             throw new Error("Invalid parameters for ctx.ellipse");
+        }
+    } catch (ellipseError) {
+        console.error("Error drawing ellipse:", { a, b, e, periapsisAngle, scaledA, scaledB, scaledC }, ellipseError);
+        ctx.restore();
+        return false; // Indicate failure
+    }
+
+    ctx.restore();
+    return true; // Indicate path was defined
+}
+
+
+function updateOrbitHistory() {
+    const player = celestialBodies.find(body => body.isPlayer);
+    const sun = celestialBodies.find(body => body.isSun);
+    if (player && sun) {
+        const orbitParams = calculateOrbitParameters(player, sun);
+        orbitHistory.unshift(orbitParams);
+        if (orbitHistory.length > ORBIT_HISTORY_LENGTH) {
+            orbitHistory.pop();
+        }
+    }
+}
+
+
+function drawCrosshair() {
+    const player = celestialBodies.find(body => body.isPlayer);
+    if (!player) return;
+
+    const playerScreenX = (player.x - camera.x) * camera.scale + canvas.width / 2;
+    const playerScreenY = (player.y - camera.y) * camera.scale + canvas.height / 2;
+    const crosshairAngle = Math.atan2(screenMouseY - playerScreenY, screenMouseX - playerScreenX);
+
+    ctx.save();
+    ctx.translate(screenMouseX, screenMouseY);
+    ctx.rotate(crosshairAngle - Math.PI / 2);
+    ctx.strokeStyle = 'white';
+    ctx.lineWidth = 2;
+
+    for (let i = 0; i < 4; i++) {
+        ctx.rotate(Math.PI / 2);
+        ctx.beginPath();
+        ctx.moveTo(5, 0);
+        const gradient = ctx.createLinearGradient(5, 0, CROSSHAIR_SIZE / 2, 0);
+        gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+        gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+        ctx.strokeStyle = gradient;
+        if (i === 0) {
+            ctx.lineTo(CROSSHAIR_LONG_LINE, 0);
+        } else {
+            ctx.lineTo(CROSSHAIR_SIZE / 2.5 - 5, 0);
+        }
+        ctx.stroke();
+    }
+
+    ctx.restore();
+}
+
+
+function drawOrbitHistory() {
+    const sun = celestialBodies.find(body => body.isSun);
+    if (!sun) return;
+
+    ctx.save();
+    ctx.lineWidth = 1; // Thin lines for history
+    orbitHistory.forEach((orbit, index) => {
+        if(orbit && isFinite(orbit.a) && isFinite(orbit.b) && orbit.a > 0 && orbit.b > 0) {
+            const alpha = 0.1 * (ORBIT_HISTORY_LENGTH - index) / ORBIT_HISTORY_LENGTH;
+            const strokeStyle = orbit.collidesSun
+                ? `rgba(255, 0, 0, ${alpha})`
+                : `rgba(173, 216, 230, ${alpha})`;
+
+            const pathDrawn = drawEllipse(ctx, sun.x, sun.y, orbit.a, orbit.b, orbit.e, orbit.periapsisAngle);
+
+            if (pathDrawn) {
+                ctx.strokeStyle = strokeStyle;
+                ctx.stroke(); // Stroke the path defined in drawEllipse
+            }
+        }
+    });
+    ctx.restore();
+}
+
+
+function calculateWarningIntensity() {
+    const player = celestialBodies.find(body => body.isPlayer);
+    if (!player) return 0;
+
+    const availableMassRange = PLAYER_INITIAL_MASS - MIN_PLAYER_MASS;
+    if (availableMassRange <= 0) return 0;
+
+    const currentMassAboveMin = player.mass - MIN_PLAYER_MASS;
+    const massRatio = currentMassAboveMin / availableMassRange;
+
+    const warningThreshold = 0.5;
+    if (massRatio > warningThreshold) {
+        return 0;
+    } else {
+        return Math.max(0, Math.min(1, 1 - (massRatio / warningThreshold)));
+    }
+}
+
+
+function interpolateWarningIntensity(targetIntensity, dt) {
+    const interpolationSpeed = 5.0;
+    const difference = targetIntensity - currentWarningIntensity;
+    // Use real dt here for smooth interpolation regardless of game speed
+    currentWarningIntensity += difference * interpolationSpeed * dt;
+     currentWarningIntensity = Math.max(0, Math.min(1, currentWarningIntensity));
+    return currentWarningIntensity;
+}
+
+
+function resetPlayer() {
+    console.log("Resetting player...");
+    const ORBIT_RADIUS = Math.min(canvas.width, canvas.height) * 0.35;
+
+    const sun = celestialBodies.find(body => body.isSun);
+
+     const currentSunMass = sun ? sun.mass : SUN_MASS;
+     const safeOrbitRadius = Math.max(1, ORBIT_RADIUS);
+     const ORBITAL_SPEED = Math.sqrt((G * currentSunMass) / safeOrbitRadius);
+
+    // Remove all non-sun bodies AND reset trail opacity on remaining sun
+    // (though sun doesn't have trails, good practice if structure changes)
+    celestialBodies = celestialBodies.filter(body => {
+        if (body.isSun) {
+            body.trailOpacity = 0; // Reset just in case
+            return true;
+        }
+        return false;
+    });
+
+    // Create a new player
+     const newPlayerX = sun ? sun.x : 0;
+     const newPlayerY = sun ? sun.y - safeOrbitRadius : -safeOrbitRadius;
+    const newPlayer = new CelestialBody(
+        newPlayerX,
+        newPlayerY,
+        ORBITAL_SPEED,
+        0,
+        PLAYER_INITIAL_MASS,
+        true
+    );
+    celestialBodies.push(newPlayer);
+
+    populateSystem(INIT_NUM_BODIES); // Repopulate (new bodies will have trailOpacity 0)
+
+    orbitHistory = [];
+    currentEjectionMultiplier = 1;
+    lastClickTime = 0;
+    currentWarningIntensity = 0;
+
+    // Reset camera
+    camera.x = newPlayer.x;
+    camera.y = newPlayer.y;
+    camera.scale = 1;
+
+    gameWon = false;
+    playerNeedsReset = false; // Ensure flag is cleared after reset
+    console.log("Player reset complete.");
+}
+
+
+function checkWinCondition() {
+    const player = celestialBodies.find(body => body.isPlayer);
+    const sun = celestialBodies.find(body => body.isSun);
+
+    if (player && sun && player.mass > sun.mass && !gameWon) {
+        gameWon = true;
+        console.log("Spieler hat gewonnen! Sonne absorbiert!");
+    }
+}
+
+
+function logBodyChanges() {
+    const currentTime = performance.now();
+    if (currentTime - lastLogTime < LOG_INTERVAL) {
+        return;
+    }
+    lastLogTime = currentTime;
+
+    let changed = false;
+    const currentState = new Map();
+
+    celestialBodies.forEach(body => {
+        if (!body) return;
+        const state = {
+            x: body.x.toFixed(2),
+            y: body.y.toFixed(2),
+            vx: body.vx.toFixed(2),
+            vy: body.vy.toFixed(2),
+            mass: body.mass.toExponential(2),
+            radius: body.radius.toFixed(2),
+            isPlayer: body.isPlayer,
+            isSun: body.isSun,
+            trailOpacity: body.trailOpacity?.toFixed(2) // Log opacity too
+        };
+        currentState.set(body.id, state);
+
+        const previousState = bodyStates.get(body.id);
+        if (!previousState || JSON.stringify(state) !== JSON.stringify(previousState)) {
+            //console.log(`Change detected for ${body.id}: `, state);
+            changed = true;
+        }
+    });
+
+    // Check for removed bodies
+    bodyStates.forEach((state, id) => {
+        if (!currentState.has(id)) {
+            //console.log(`Body removed: ${id}`);
+            changed = true;
+        }
+    });
+
+    bodyStates = currentState; // Update the stored state
+}
+
+
+function draw() {
+    ctx.fillStyle = 'black';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // --- Draw Trails FIRST ---
+    // Draw PLAYER orbit history
+    drawOrbitHistory();
+
+    // Draw FAINT, FADING orbit trails for nearby OTHER non-sun bodies
+    ctx.save();
+    ctx.lineWidth = 2; // Set line width to 1.5
+    const baseTrailAlpha = 0.38; // Base visibility when fully faded in
+    const sunForTrailDraw = celestialBodies.find(b => b.isSun);
+
+    if (sunForTrailDraw) {
+        for (const body of celestialBodies) {
+            // **MODIFIED:** Check trailOpacity > 0 instead of proximity directly
+            if (body && !body.isPlayer && !body.isSun && body.mass > 1e-9 && body.trailOpacity > 0 && isFinite(body.orbitA) && body.orbitA > 0 && isFinite(body.orbitB) && body.orbitB > 0)
+            {
+                 // **MODIFIED:** Calculate final alpha based on trailOpacity
+                 const finalAlpha = baseTrailAlpha * body.trailOpacity;
+                 ctx.strokeStyle = `rgba(100, 100, 100, ${finalAlpha})`; // Use fading alpha
+
+                 const pathDrawn = drawEllipse(ctx, sunForTrailDraw.x, sunForTrailDraw.y, body.orbitA, body.orbitB, body.orbitE, body.orbitPeriapsisAngle);
+                 if (pathDrawn) {
+                    ctx.stroke(); // Stroke the single ellipse path
+                 }
+            }
+        }
+    }
+    ctx.restore();
+
+
+    // --- Draw Bodies SECOND ---
+    const validBodies = celestialBodies.filter(b => b && b.mass > 1e-9); // Filter near-zero mass too
+
+    const bodiesToDraw = validBodies.sort((a, b) => { // Sort valid bodies
+        if (a.isSun) return -1;
+        if (b.isSun) return 1;
+        if (a.isPlayer) return 1;
+        if (b.isPlayer) return -1;
+        return a.mass - b.mass; // Smaller drawn first
+    });
+
+    for (const body of bodiesToDraw) {
+        const scaledX = (body.x - camera.x) * camera.scale + canvas.width / 2;
+        const scaledY = (body.y - camera.y) * camera.scale + canvas.height / 2;
+        const scaledRadius = body.radius * camera.scale;
+
+        if (scaledRadius < 0.5 && !body.isPlayer && !body.isSun) continue;
+
+        if (scaledX + scaledRadius < 0 || scaledX - scaledRadius > canvas.width ||
+            scaledY + scaledRadius < 0 || scaledY - scaledRadius > canvas.height) {
+            continue;
+        }
+
+        if (body.isSun) {
+            ctx.fillStyle = 'yellow';
+        } else if (body.isPlayer) {
+            const redValue = Math.round(255 * (1 - currentWarningIntensity * 0.35));
+            const greenBlueValue = Math.round(255 * (1 - currentWarningIntensity));
+            ctx.fillStyle = `rgb(${redValue}, ${greenBlueValue}, ${greenBlueValue})`;
+        } else {
+            // Use trailOpacity to slightly fade distant bodies themselves? Optional.
+            // const bodyAlpha = 0.6 + 0.4 * body.trailOpacity; // Example: slightly dimmer when trail is faded
+            const bodyAlpha = 0.6; // Keep body visibility constant for now
+            ctx.fillStyle = `rgba(255, 255, 255, ${bodyAlpha})`;
+        }
+
+        ctx.beginPath();
+        ctx.arc(scaledX, scaledY, Math.max(0.5, scaledRadius), 0, Math.PI * 2);
+        ctx.fill();
+
+        if (body.isPlayer) {
+            ctx.strokeStyle = 'red';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(scaledX, scaledY);
+            ctx.lineTo(
+                scaledX + Math.cos(body.angle) * Math.max(0.5, scaledRadius) * 1.4,
+                scaledY + Math.sin(body.angle) * Math.max(0.5, scaledRadius) * 1.4
+            );
+            ctx.stroke();
+        }
+    }
+
+    // --- Draw UI LAST ---
+    drawCrosshair();
+
+    if (currentWarningIntensity > 0.75 && !gameWon) {
+        ctx.fillStyle = `rgba(255, 0, 0, ${currentWarningIntensity})`;
+        ctx.font = '24px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('KRITISCHE MASSE!', canvas.width / 2, 30);
+    }
+
+    if (gameWon) {
+        ctx.fillStyle = 'rgba(0, 255, 0, 1)';
+        ctx.font = '48px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('GEWONNEN!', canvas.width / 2, canvas.height / 2);
+    }
+
+    logBodyChanges();
+}
+
+// Game Loop
+let lastTime = 0;
+let animationFrameId = null;
+
+function gameLoop(currentTime) {
+    animationFrameId = requestAnimationFrame(gameLoop);
+
+    try {
+        const now = performance.now();
+        const rawDt = (now - lastTime) / 1000;
+        lastTime = now;
+        // Use the rawDt for physics and fading, but cap it to prevent large jumps
+        const dt = Math.min(rawDt, 0.1);
+
+        if (dt <= 0) return;
+
+        updatePhysics(dt); // Use real dt for physics and fading logic
+        // Draw only if the simulation state wasn't just reset
+        if (!playerNeedsReset) { // Check flag AFTER updatePhysics
+             draw();
+        }
+
+    } catch (error) {
+        console.error("Error in game loop:", error);
+        if (animationFrameId) {
+             cancelAnimationFrame(animationFrameId);
+        }
+        if (ctx) {
+            ctx.fillStyle = 'red';
+            ctx.font = '16px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText('Ein Fehler ist aufgetreten. Siehe Konsole (F12).', canvas.width / 2, canvas.height / 2);
+        }
+    }
+}
+
+// Initialization
+try {
+    initializeGame();
+    lastTime = performance.now();
+    animationFrameId = requestAnimationFrame(gameLoop);
+} catch (initError) {
+     console.error("Error during initialization:", initError);
+     const canvasElem = document.getElementById('gameCanvas');
+     const context = canvasElem ? canvasElem.getContext('2d') : null;
+     if(context) {
+        context.fillStyle = 'red';
+        context.font = '16px Arial';
+        context.textAlign = 'center';
+        context.fillText('Fehler bei der Initialisierung. Siehe Konsole (F12).', canvasElem.width / 2, canvasElem.height / 2);
+     }
+}
+
+</script>
+</body>
+</html>

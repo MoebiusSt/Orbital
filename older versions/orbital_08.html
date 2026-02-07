@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Korrigiertes vereinfachtes Orbitales Mechanik-Modell</title>
+    <style>
+        canvas {
+            border: 1px solid black;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="orbitCanvas" width="800" height="600"></canvas>
+    <script>
+    // Konstanten
+    const G = 6.67430e-11;
+    const SUN_MASS = 2.989e30;
+    const PLANET_MASS = 1.97e24;
+    const INITIAL_DISTANCE = 1.5e11;
+    const INITIAL_VELOCITY = 2.0783e4;
+
+    // Canvas-Setup
+    const canvas = document.getElementById('orbitCanvas');
+    const ctx = canvas.getContext('2d');
+    const centerX = canvas.width / 2;
+    const centerY = canvas.height / 2;
+    const scale = 1e-9; // Skalierungsfaktor für die Darstellung
+
+    // Objekte
+    const sun = { x: 0, y: 0, mass: SUN_MASS };
+    const planet = {
+        x: INITIAL_DISTANCE,
+        y: 0,
+        vx: 0,
+        vy: INITIAL_VELOCITY,
+        mass: PLANET_MASS
+    };
+
+    function updatePosition(dt) {
+        const dx = planet.x - sun.x;
+        const dy = planet.y - sun.y;
+        const r = Math.sqrt(dx*dx + dy*dy);
+        const f = G * sun.mass * planet.mass / (r * r);
+        const ax = -f * dx / (r * planet.mass);
+        const ay = -f * dy / (r * planet.mass);
+
+        planet.vx += ax * dt;
+        planet.vy += ay * dt;
+        planet.x += planet.vx * dt;
+        planet.y += planet.vy * dt;
+    }
+
+    function calculateOrbitParameters() {
+        const rx = planet.x - sun.x;
+        const ry = planet.y - sun.y;
+        const r = Math.sqrt(rx * rx + ry * ry);
+        const v = Math.sqrt(planet.vx * planet.vx + planet.vy * planet.vy);
+        const mu = G * (sun.mass + planet.mass);
+
+        const energy = v * v / 2 - mu / r;
+        const a = -mu / (2 * energy);
+        const h = rx * planet.vy - ry * planet.vx;
+        const p = h * h / mu;
+        const e = Math.sqrt(1 - p / a);
+        const b = a * Math.sqrt(1 - e * e);
+
+        // Calculate eccentricity vector
+        const ex = ((v * v - mu / r) * rx - (rx * planet.vx + ry * planet.vy) * planet.vx) / mu;
+        const ey = ((v * v - mu / r) * ry - (rx * planet.vx + ry * planet.vy) * planet.vy) / mu;
+
+        // Calculate true anomaly
+        let trueAnomaly = Math.atan2(h * ry, h * rx - mu * r);
+        if (trueAnomaly < 0) {
+            trueAnomaly += 2 * Math.PI;
+        }
+
+        // Calculate the angle of periapsis
+        const periapsisAngle = Math.atan2(ey, ex);
+
+        return { a, b, e, trueAnomaly, periapsisAngle };
+    }
+
+    function drawOrbit() {
+        const { a, b, e, trueAnomaly, periapsisAngle } = calculateOrbitParameters();
+
+        ctx.save();
+        ctx.translate(centerX, centerY);
+        ctx.rotate(periapsisAngle);
+
+        ctx.beginPath();
+        ctx.ellipse(-e * a * scale, 0, a * scale, b * scale, 0, 0, 2 * Math.PI);
+        ctx.strokeStyle = 'rgba(255, 0, 0, 0.5)';
+        ctx.stroke();
+
+        // Draw line from sun to planet
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(a * (Math.cos(trueAnomaly) - e) * scale, b * Math.sin(trueAnomaly) * scale);
+        ctx.strokeStyle = 'rgba(0, 255, 0, 0.5)';
+        ctx.stroke();
+
+        ctx.restore();
+    }
+
+    function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Zeichne Sonne
+        ctx.fillStyle = 'yellow';
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, 10, 0, 2 * Math.PI);
+        ctx.fill();
+
+        // Zeichne Planet
+        ctx.fillStyle = 'blue';
+        ctx.beginPath();
+        ctx.arc(centerX + planet.x * scale, centerY + planet.y * scale, 5, 0, 2 * Math.PI);
+        ctx.fill();
+
+        drawOrbit();
+    }
+
+    function animate() {
+        updatePosition(3600); // Zeitschritt von einer Stunde
+        draw();
+        requestAnimationFrame(animate);
+    }
+
+    animate();
+    </script>
+</body>
+</html>

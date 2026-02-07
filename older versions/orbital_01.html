@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orbitales Mechanik-Spiel</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #f0f0f0;
+        }
+        canvas {
+            border: 1px solid #000;
+        }
+    </style>
+</head>
+<body>
+    <script>
+    // Constants
+    const CANVAS_WIDTH = 1680;
+    const CANVAS_HEIGHT = 1024;
+    const PLAYER_RADIUS = 15;
+    const SUN_RADIUS = 30;
+    const G = 6.67430e-11 * 0.1;
+    const MASS_EJECTION_RATIO = 0.05;
+    const PLAYER_INITIAL_MASS = 1000;
+    const SUN_MASS = 1e14;
+
+    // Calculate initial orbit
+    const ORBIT_RADIUS = Math.min(CANVAS_WIDTH, CANVAS_HEIGHT) * 0.35;
+    const ORBITAL_SPEED = Math.sqrt((G * SUN_MASS) / ORBIT_RADIUS);
+
+    // Game state
+    let player = {
+        x: CANVAS_WIDTH / 2,
+        y: CANVAS_HEIGHT / 2 - ORBIT_RADIUS,
+        vx: ORBITAL_SPEED,
+        vy: 0,
+        angle: 0,
+        radius: PLAYER_RADIUS,
+        mass: PLAYER_INITIAL_MASS
+    };
+
+    let sun = {
+        x: CANVAS_WIDTH / 2,
+        y: CANVAS_HEIGHT / 2,
+        mass: SUN_MASS
+    };
+
+    let mouseX = 0;
+    let mouseY = 0;
+
+    let ejectedMasses = [];
+
+    // Canvas setup
+    const canvas = document.createElement('canvas');
+    canvas.width = CANVAS_WIDTH;
+    canvas.height = CANVAS_HEIGHT;
+    document.body.appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+
+    // Event listeners
+    canvas.addEventListener('mousemove', updateMousePosition);
+    canvas.addEventListener('click', ejectMass);
+
+    function updateMousePosition(event) {
+        const rect = canvas.getBoundingClientRect();
+        mouseX = event.clientX - rect.left;
+        mouseY = event.clientY - rect.top;
+    }
+
+    function ejectMass() {
+        const ejectedMass = player.mass * MASS_EJECTION_RATIO;
+        const ejectionSpeed = 2;
+        
+        // Calculate direction towards mouse
+        const dx = mouseX - player.x;
+        const dy = mouseY - player.y;
+        const distance = Math.sqrt(dx*dx + dy*dy);
+        
+        // Update player's velocity (opposite to mouse direction)
+        player.vx -= (dx / distance) * ejectionSpeed * ejectedMass / player.mass;
+        player.vy -= (dy / distance) * ejectionSpeed * ejectedMass / player.mass;
+        
+        // Create ejected mass particle
+        ejectedMasses.push({
+            x: player.x,
+            y: player.y,
+            vx: (dx / distance) * ejectionSpeed,
+            vy: (dy / distance) * ejectionSpeed,
+            radius: Math.sqrt(ejectedMass / PLAYER_INITIAL_MASS) * PLAYER_RADIUS,
+            lifespan: 200 // frames
+        });
+        
+        // Reduce player's mass and radius
+        player.mass -= ejectedMass;
+        player.radius = Math.sqrt(player.mass / PLAYER_INITIAL_MASS) * PLAYER_RADIUS;
+    }
+
+    function updatePhysics() {
+        // Update player
+        const dx = sun.x - player.x;
+        const dy = sun.y - player.y;
+        const distanceSquared = dx * dx + dy * dy;
+        const distance = Math.sqrt(distanceSquared);
+        const force = G * player.mass * sun.mass / distanceSquared;
+        const acceleration = force / player.mass;
+        
+        player.vx += acceleration * dx / distance;
+        player.vy += acceleration * dy / distance;
+        
+        player.x += player.vx;
+        player.y += player.vy;
+
+        player.angle = Math.atan2(mouseY - player.y, mouseX - player.x);
+
+        // Update ejected masses
+        for (let i = ejectedMasses.length - 1; i >= 0; i--) {
+            const mass = ejectedMasses[i];
+            mass.x += mass.vx;
+            mass.y += mass.vy;
+            mass.lifespan--;
+            if (mass.lifespan <= 0) {
+                ejectedMasses.splice(i, 1);
+            }
+        }
+    }
+
+    function draw() {
+        // Clear canvas
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+        
+        // Draw sun
+        ctx.fillStyle = 'yellow';
+        ctx.beginPath();
+        ctx.arc(sun.x, sun.y, SUN_RADIUS, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Draw player
+        ctx.fillStyle = 'white';
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, player.radius, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Draw player's direction
+        ctx.strokeStyle = 'red';
+        ctx.beginPath();
+        ctx.moveTo(player.x, player.y);
+        ctx.lineTo(
+            player.x + Math.cos(player.angle) * player.radius * 1.5,
+            player.y + Math.sin(player.angle) * player.radius * 1.5
+        );
+        ctx.stroke();
+
+        // Draw ejected masses
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+        for (const mass of ejectedMasses) {
+            ctx.beginPath();
+            ctx.arc(mass.x, mass.y, mass.radius, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+
+    function gameLoop() {
+        updatePhysics();
+        draw();
+        requestAnimationFrame(gameLoop);
+    }
+
+    // Start the game
+    gameLoop();
+    </script>
+</body>
+</html>

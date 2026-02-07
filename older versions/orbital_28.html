@@ -1,0 +1,1157 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orbitales Mechanik-Spiel</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+        canvas {
+            display: block;
+            cursor: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+<script>
+// ============================================================
+// CONSTANTS
+// ============================================================
+const PLAYER_RADIUS = 30;
+const DENSITY = 1000;
+
+// --- MASS SYSTEM (KEY DESIGN) ---
+// The sun has TWO separate mass concepts:
+//
+// 1) GRAVITATIONAL MASS: Huge (1e20), used ONLY for gravity calculation.
+//    This stays constant and keeps all orbits at the right speed.
+//    It is NOT something the player "consumes" or competes against.
+//
+// 2) GAME MASS: Reachable (~3e10), determines win-condition, visual size,
+//    and what % the HUD shows. When the player's mass exceeds this,
+//    they can absorb the sun.
+//
+// The gravity felt by all bodies is:  G * SUN_GRAVITATIONAL_MASS
+// But the "progress" shown is:        player.mass / SUN_GAME_MASS
+//
+// During absorption, the GRAVITATIONAL pull of the sun fades out via
+// gravityBlendFactor, while the player's pull fades in, keeping orbits stable.
+
+const SUN_GRAVITATIONAL_MASS = 1e20;  // Only for F = G*m1*m2/r² — never shown, never consumed
+const G = 6.67430e-11 * 0.1;
+
+const PLAYER_INITIAL_MASS = calculateMassFromRadius(PLAYER_RADIUS);
+const MIN_PLAYER_MASS = PLAYER_INITIAL_MASS * 0.1;
+
+// Game mass: set so that eating all ~400 bodies (avg ~0.3 * player mass each)
+// gets you to about 60-70% of this value. Total eatable mass ≈ 1.37e10.
+// So SUN_GAME_MASS ≈ 2e10 means eating everything gets you ~68%.
+// You need to be strategic about which bodies to eat.
+const SUN_GAME_MASS = PLAYER_INITIAL_MASS * 180;  // ~2.04e10, reachable!
+
+// Sun visual radius at full game-mass
+const SUN_DISPLAY_RADIUS = 120;
+
+// For gravity during crossover: when sun loses game-mass, its gravitational
+// contribution fades and player's grows. This multiplier makes the player's
+// gravity feel equivalent once they absorb enough.
+const GRAVITY_CROSSOVER_MULTIPLIER = SUN_GRAVITATIONAL_MASS / SUN_GAME_MASS;
+// ≈ 4.9e9 — player's mass gets multiplied by this for gravity when they become center
+
+const INIT_NUM_BODIES = 400;
+
+const CROSSHAIR_SIZE = 40;
+const CROSSHAIR_LONG_LINE = 25;
+const ORBIT_HISTORY_LENGTH = 90;
+
+// --- Minimum Mass Thresholds ---
+const MIN_BODY_MASS = PLAYER_INITIAL_MASS * 0.005;
+const MIN_TRAIL_RADIUS_PX = 1.5;
+
+// --- Ejection ---
+const BASE_EJECTION_MASS_PERCENT = 0.0005;
+const MAX_EJECTION_MULTIPLIER = 85;
+const EJECTION_GROWTH_RATE = 3;
+const QUICK_CLICK_THRESHOLD = 260;
+const MAX_EJECTION_PERCENTAGE = 0.5;
+const EJECTION_BASE_SPEED = 1200;
+const EJECTION_PROPULSION_MULTIPLIER = 45;
+const EJECTION_DECAY_RATE = 0.97;
+const EJECTION_DECAY_INTERVAL = 300;
+
+// --- Collision ---
+const MASS_TRANSFER_PERCENT_PER_SEC = 4.0;
+const EJECTION_COLLISION_DELAY = 300;
+
+// --- Sun Absorption ---
+const SUN_ABSORPTION_RATE = 1.5;           // Game-mass transfer per second during overlap
+const SUN_ABSORPTION_START_RATIO = 0.4;    // Player needs 40% of SUN_GAME_MASS to start
+const SUN_ABSORPTION_RANGE_MULTIPLIER = 2.5;
+
+// --- Sparks ---
+const MIN_SPARKS = 2;
+const MAX_SPARKS = 20;
+const SPARK_MASS = PLAYER_INITIAL_MASS * 0.00001;
+const MIN_SPARK_SPEED_MULTIPLIER = 0.8;
+const MAX_SPARK_SPEED_MULTIPLIER = 2.2;
+const SPARK_SPEED_RANDOMNESS = 0.2;
+const MAX_SPARK_SPREAD_ANGLE = Math.PI / 6;
+const MIN_SPARK_SPREAD_ANGLE = Math.PI / 18;
+const SPARK_LIFESPAN = 1600;
+const SPARK_MIN_DRAW_RADIUS = 0.8;
+
+// --- Game Speed ---
+const BASE_GAME_SPEED = 0.1;
+const FAST_GAME_SPEED = 1.0;
+let currentGameSpeed = BASE_GAME_SPEED;
+
+// --- Trail Fading ---
+const TRAIL_FADE_IN_RATE = 0.6;
+const TRAIL_FADE_OUT_RATE = 0.3;
+const TRAIL_PROXIMITY_FACTOR = 5;
+
+// ============================================================
+// GLOBAL STATE
+// ============================================================
+let canvas, ctx;
+let mouseX = 0, mouseY = 0;
+let screenMouseX = 0, screenMouseY = 0;
+let camera = {x: 0, y: 0, scale: 1};
+let orbitHistory = [];
+
+let lastClickTime = 0;
+let lastEjectionDecayTime = 0;
+let currentEjectionMultiplier = 1;
+let currentWarningIntensity = 0;
+
+let celestialBodies = [];
+
+let lastLogTime = 0;
+const LOG_INTERVAL = 5000;
+let bodyStates = new Map();
+
+// Win / Absorption State
+let gameWon = false;
+let playerIsGravitationalCenter = false;
+let sunAbsorptionProgress = 0;  // 0 to 1 (based on game-mass consumed)
+let gravityBlendFactor = 0;     // 0 = sun gravity, 1 = player gravity (crossover)
+let sunCurrentGameMass = SUN_GAME_MASS; // Tracks remaining "game mass" of sun
+
+// Flags
+let collisionDetectedThisFrame = false;
+let playerNeedsReset = false;
+
+// ============================================================
+// UTILITY FUNCTIONS
+// ============================================================
+function calculateRadiusFromMass(mass) {
+    if (mass <= 0) return 0.1;
+    const volume = mass / DENSITY;
+    return Math.cbrt((3 * volume) / (4 * Math.PI));
+}
+
+function calculateMassFromRadius(radius) {
+    return (4/3) * Math.PI * Math.pow(Math.max(0.1, radius), 3) * DENSITY;
+}
+
+// Sun display radius scales with its remaining GAME mass (not gravitational mass)
+function getSunDisplayRadius(gameMassFraction) {
+    // gameMassFraction: 0 (absorbed) to 1 (full)
+    // Cube root scaling so it shrinks visibly but not too fast
+    return SUN_DISPLAY_RADIUS * Math.cbrt(Math.max(0, gameMassFraction));
+}
+
+// ============================================================
+// CELESTIAL BODY CLASS
+// ============================================================
+class CelestialBody {
+    constructor(x, y, vx, vy, mass, isPlayer = false, isSun = false, isSpark = false) {
+        this.x = x;
+        this.y = y;
+        this.vx = vx;
+        this.vy = vy;
+        this._mass = mass;
+        this.isPlayer = isPlayer;
+        this.isSun = isSun;
+        this.isSpark = isSpark;
+        this.isGravitationalCenter = isSun;
+        this.creationTime = Date.now();
+        this.angle = 0;
+        this._radius = this._calculateRadius(mass);
+        this.id = (isPlayer ? 'P' : isSun ? 'S' : isSpark ? 'K' : 'M')
+                  + this.creationTime.toString(36)
+                  + Math.random().toString(36).substring(2, 8);
+
+        this.orbitA = 0;
+        this.orbitB = 0;
+        this.orbitE = 0;
+        this.orbitPeriapsisAngle = 0;
+        this.orbitCollidesCenter = false;
+        this.trailOpacity = 0;
+    }
+
+    _calculateRadius(mass) {
+        if (this.isSun) {
+            // Sun radius is based on game-mass fraction, not actual mass
+            const fraction = sunCurrentGameMass / SUN_GAME_MASS;
+            return getSunDisplayRadius(fraction);
+        }
+        return calculateRadiusFromMass(mass);
+    }
+
+    get mass() { return this._mass; }
+
+    set mass(newMass) {
+        this._mass = Math.max(0, newMass);
+        this._radius = this._calculateRadius(this._mass);
+        if (this._mass < 1e-9 && !this.isSun && !this.isPlayer) {
+            this._radius = 0.1;
+        }
+    }
+
+    get radius() {
+        if (this.isSun) {
+            const fraction = sunCurrentGameMass / SUN_GAME_MASS;
+            return Math.max(1, getSunDisplayRadius(fraction));
+        }
+        return Math.max(0.5, this._radius);
+    }
+}
+
+// ============================================================
+// INITIALIZATION
+// ============================================================
+function initializeGame() {
+    canvas = document.getElementById('gameCanvas');
+    ctx = canvas.getContext('2d');
+    resizeCanvas();
+
+    sunCurrentGameMass = SUN_GAME_MASS;
+
+    celestialBodies = [
+        new CelestialBody(0, 0, 0, 0, SUN_GAME_MASS, false, true),
+    ];
+
+    const sun = celestialBodies[0];
+    const orbitRadius = Math.min(canvas.width, canvas.height) * 0.35;
+    // Orbital speed uses the GRAVITATIONAL mass (the huge one), not the game mass
+    const orbitalSpeed = Math.sqrt((G * SUN_GRAVITATIONAL_MASS) / orbitRadius);
+
+    celestialBodies.push(
+        new CelestialBody(0, -orbitRadius, orbitalSpeed, 0, PLAYER_INITIAL_MASS, true)
+    );
+
+    playerIsGravitationalCenter = false;
+    sunAbsorptionProgress = 0;
+    gravityBlendFactor = 0;
+
+    populateSystem(INIT_NUM_BODIES);
+
+    gameWon = false;
+    playerNeedsReset = false;
+    orbitHistory = [];
+    currentEjectionMultiplier = 1;
+    lastClickTime = 0;
+    lastEjectionDecayTime = 0;
+    currentWarningIntensity = 0;
+    camera = {x: 0, y: 0, scale: 1};
+
+    window.addEventListener('resize', resizeCanvas);
+    canvas.addEventListener('mousemove', updateMousePosition);
+    canvas.addEventListener('click', ejectMass);
+    canvas.addEventListener('wheel', handleZoom);
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+
+    console.log("=== Game Initialized ===");
+    console.log("Player initial mass:", PLAYER_INITIAL_MASS.toExponential(2));
+    console.log("Sun GAME mass:", SUN_GAME_MASS.toExponential(2), "(reachable!)");
+    console.log("Sun GRAVITATIONAL mass:", SUN_GRAVITATIONAL_MASS.toExponential(2), "(for orbits only)");
+    console.log("Ratio player/sun-game:", (PLAYER_INITIAL_MASS / SUN_GAME_MASS * 100).toFixed(2) + "%");
+    console.log("Sun display radius:", sun.radius.toFixed(1));
+    console.log("Gravity crossover multiplier:", GRAVITY_CROSSOVER_MULTIPLIER.toExponential(2));
+}
+
+// ============================================================
+// INPUT HANDLERS
+// ============================================================
+function handleKeyDown(event) {
+    if (event.code === 'Space') currentGameSpeed = FAST_GAME_SPEED;
+}
+function handleKeyUp(event) {
+    if (event.code === 'Space') currentGameSpeed = BASE_GAME_SPEED;
+}
+function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+function updateMousePosition(event) {
+    const rect = canvas.getBoundingClientRect();
+    screenMouseX = event.clientX - rect.left;
+    screenMouseY = event.clientY - rect.top;
+    mouseX = (screenMouseX - canvas.width / 2) / camera.scale + camera.x;
+    mouseY = (screenMouseY - canvas.height / 2) / camera.scale + camera.y;
+}
+function handleZoom(event) {
+    event.preventDefault();
+    const zoomFactor = event.deltaY > 0 ? 0.9 : 1.1;
+    const wXBefore = (screenMouseX - canvas.width / 2) / camera.scale + camera.x;
+    const wYBefore = (screenMouseY - canvas.height / 2) / camera.scale + camera.y;
+    camera.scale = Math.max(0.05, Math.min(5, camera.scale * zoomFactor));
+    camera.x += wXBefore - ((screenMouseX - canvas.width / 2) / camera.scale + camera.x);
+    camera.y += wYBefore - ((screenMouseY - canvas.height / 2) / camera.scale + camera.y);
+}
+
+// ============================================================
+// SYSTEM POPULATION
+// ============================================================
+function populateSystem(numMasses) {
+    const centerBody = celestialBodies.find(b => b.isGravitationalCenter);
+    if (!centerBody) { console.error("No gravitational center."); return; }
+
+    let largerCount = 0;
+    for (let i = 0; i < numMasses; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const baseDist = Math.max(centerBody.radius, SUN_DISPLAY_RADIUS);
+        const distance = baseDist * 3.5 + Math.random() * baseDist * 15;
+        const x = centerBody.x + Math.cos(angle) * distance;
+        const y = centerBody.y + Math.sin(angle) * distance;
+
+        // Orbital speed always based on GRAVITATIONAL mass
+        const gravMass = centerBody.isSun ? SUN_GRAVITATIONAL_MASS : centerBody.mass * GRAVITY_CROSSOVER_MULTIPLIER;
+        const orbitalSpeed = Math.sqrt((G * gravMass) / Math.max(1, distance));
+        const sf = 0.9 + Math.random() * 0.2;
+        const vx = centerBody.vx - Math.sin(angle) * orbitalSpeed * sf;
+        const vy = centerBody.vy + Math.cos(angle) * orbitalSpeed * sf;
+
+        const rand = Math.random();
+        let mass;
+        if (rand < 0.7) mass = PLAYER_INITIAL_MASS * (0.02 + Math.random() * 0.2);
+        else if (rand < 0.9) mass = PLAYER_INITIAL_MASS * (0.4 + Math.random() * 0.5);
+        else { mass = PLAYER_INITIAL_MASS * (1.1 + Math.random() * 1.4); largerCount++; }
+        mass = Math.max(MIN_BODY_MASS, mass);
+
+        celestialBodies.push(new CelestialBody(x, y, vx, vy, mass));
+    }
+    console.log(`Populated ${numMasses} bodies (${largerCount} larger than player).`);
+}
+
+// ============================================================
+// EJECTION
+// ============================================================
+function ejectMass() {
+    const player = celestialBodies.find(b => b.isPlayer);
+    if (!player || player.mass <= MIN_PLAYER_MASS) return;
+
+    const currentTime = Date.now();
+    const timeSince = currentTime - lastClickTime;
+    const initMass = player.mass;
+
+    if (timeSince <= QUICK_CLICK_THRESHOLD)
+        currentEjectionMultiplier = Math.min(currentEjectionMultiplier * EJECTION_GROWTH_RATE, MAX_EJECTION_MULTIPLIER);
+    else currentEjectionMultiplier = 1;
+
+    let ejectedMass = Math.min(initMass * BASE_EJECTION_MASS_PERCENT * currentEjectionMultiplier, initMass * MAX_EJECTION_PERCENTAGE);
+    if (initMass - ejectedMass < MIN_PLAYER_MASS) {
+        ejectedMass = initMass - MIN_PLAYER_MASS;
+        if (ejectedMass <= 1e-9) return;
+    }
+
+    const intRange = MAX_EJECTION_PERCENTAGE - BASE_EJECTION_MASS_PERCENT;
+    let normInt = intRange > 1e-9 ? ((ejectedMass / initMass) - BASE_EJECTION_MASS_PERCENT) / intRange : 0;
+    normInt = Math.max(0, Math.min(1, normInt));
+
+    const numSparks = Math.round(MIN_SPARKS + (MAX_SPARKS - MIN_SPARKS) * normInt);
+    const sparkSpeedMult = MIN_SPARK_SPEED_MULTIPLIER + (MAX_SPARK_SPEED_MULTIPLIER - MIN_SPARK_SPEED_MULTIPLIER) * normInt * 170;
+    const sparkSpreadAngle = MAX_SPARK_SPREAD_ANGLE - (MAX_SPARK_SPREAD_ANGLE - MIN_SPARK_SPREAD_ANGLE) * normInt * 15;
+
+    const speedF = ejectedMass > 1e-9 ? Math.sqrt((initMass * BASE_EJECTION_MASS_PERCENT) / ejectedMass) : 1;
+    const mainSpeed = EJECTION_BASE_SPEED * speedF;
+
+    player.mass -= ejectedMass;
+
+    const px = (player.x - camera.x) * camera.scale + canvas.width / 2;
+    const py = (player.y - camera.y) * camera.scale + canvas.height / 2;
+    const angle = Math.atan2(screenMouseY - py, screenMouseX - px);
+
+    if (ejectedMass >= MIN_BODY_MASS) {
+        const er = calculateRadiusFromMass(ejectedMass);
+        const sd = player.radius + er * 1.1;
+        celestialBodies.push(new CelestialBody(
+            player.x + Math.cos(angle) * sd, player.y + Math.sin(angle) * sd,
+            player.vx + Math.cos(angle) * mainSpeed, player.vy + Math.sin(angle) * mainSpeed,
+            ejectedMass
+        ));
+    }
+
+    if (numSparks > 0) {
+        const sr = calculateRadiusFromMass(SPARK_MASS);
+        const sd = player.radius + sr * 1.5;
+        for (let i = 0; i < numSparks; i++) {
+            const sa = angle + (Math.random() - 0.5) * sparkSpreadAngle;
+            const ss = mainSpeed * sparkSpeedMult * (1 + (Math.random() - 0.5) * 2 * SPARK_SPEED_RANDOMNESS);
+            celestialBodies.push(new CelestialBody(
+                player.x + Math.cos(angle) * sd, player.y + Math.sin(angle) * sd,
+                player.vx + Math.cos(sa) * ss, player.vy + Math.sin(sa) * ss,
+                SPARK_MASS, false, false, true
+            ));
+        }
+    }
+
+    if (player.mass > 1e-9) {
+        const imp = (ejectedMass * mainSpeed / player.mass) * EJECTION_PROPULSION_MULTIPLIER;
+        player.vx -= Math.cos(angle) * imp;
+        player.vy -= Math.sin(angle) * imp;
+    }
+
+    lastClickTime = currentTime;
+}
+
+function decayEjectionMultiplier() {
+    const now = Date.now();
+    if (now - lastClickTime > QUICK_CLICK_THRESHOLD && now - lastEjectionDecayTime > EJECTION_DECAY_INTERVAL) {
+        currentEjectionMultiplier = Math.max(1, currentEjectionMultiplier * EJECTION_DECAY_RATE);
+        lastEjectionDecayTime = now;
+    }
+}
+
+// ============================================================
+// PHYSICS
+// ============================================================
+function updatePhysics(dt) {
+    const gameDt = dt * currentGameSpeed;
+    collisionDetectedThisFrame = false;
+
+    // --- Cleanup ---
+    const now = Date.now();
+    celestialBodies = celestialBodies.filter(body => {
+        if (!body) return false;
+        if (body.isSpark && (now - body.creationTime) >= SPARK_LIFESPAN) return false;
+        if (!body.isPlayer && !body.isGravitationalCenter && !body.isSun && !body.isSpark) {
+            if (body.mass < MIN_BODY_MASS) return false;
+        }
+        return true;
+    });
+
+    // --- GRAVITY: Dual-source with crossover blend ---
+    const sun = celestialBodies.find(b => b.isSun);
+    const player = celestialBodies.find(b => b.isPlayer);
+
+    // Sun gravity (uses the FIXED gravitational mass, weighted by 1-blend)
+    if (gravityBlendFactor < 1 && sun) {
+        const sunWeight = 1 - gravityBlendFactor;
+        const effectiveGravMass = SUN_GRAVITATIONAL_MASS * sunWeight;
+        for (let i = 0; i < celestialBodies.length; i++) {
+            const body = celestialBodies[i];
+            if (!body || body === sun || body.mass <= 0) continue;
+            const dx = sun.x - body.x, dy = sun.y - body.y;
+            const distSq = dx * dx + dy * dy;
+            const dist = Math.sqrt(distSq + 1e-6);
+            if (dist > 0) {
+                const acc = G * effectiveGravMass / distSq;
+                body.vx += acc * dx / dist * gameDt;
+                body.vy += acc * dy / dist * gameDt;
+            }
+        }
+    }
+
+    // Player gravity (weighted by blend, uses crossover multiplier)
+    if (gravityBlendFactor > 0 && player && player.mass > 0) {
+        const playerWeight = gravityBlendFactor;
+        // Player's effective gravitational mass = their real mass * multiplier * weight
+        const effectivePlayerGravMass = player.mass * GRAVITY_CROSSOVER_MULTIPLIER * playerWeight;
+        for (let i = 0; i < celestialBodies.length; i++) {
+            const body = celestialBodies[i];
+            if (!body || body === player || body.mass <= 0 || body.isSun) continue;
+            const dx = player.x - body.x, dy = player.y - body.y;
+            const distSq = dx * dx + dy * dy;
+            const dist = Math.sqrt(distSq + 1e-6);
+            if (dist > 0) {
+                const acc = G * effectivePlayerGravMass / distSq;
+                body.vx += acc * dx / dist * gameDt;
+                body.vy += acc * dy / dist * gameDt;
+            }
+        }
+    }
+
+    // Post-win: player is sole gravity source
+    if (!sun && gameWon && player) {
+        const gm = player.mass * GRAVITY_CROSSOVER_MULTIPLIER;
+        for (let i = 0; i < celestialBodies.length; i++) {
+            const body = celestialBodies[i];
+            if (!body || body === player || body.mass <= 0) continue;
+            const dx = player.x - body.x, dy = player.y - body.y;
+            const distSq = dx * dx + dy * dy;
+            const dist = Math.sqrt(distSq + 1e-6);
+            if (dist > 0) {
+                const acc = G * gm / distSq;
+                body.vx += acc * dx / dist * gameDt;
+                body.vy += acc * dy / dist * gameDt;
+            }
+        }
+    }
+
+    if (!sun && !player && !gameWon) {
+        playerNeedsReset = true;
+    }
+
+    // --- Update Positions ---
+    for (let body of celestialBodies) {
+        if (!body) continue;
+        const MAX_V = 15000;
+        const sSq = body.vx * body.vx + body.vy * body.vy;
+        if (sSq > MAX_V * MAX_V) {
+            const f = MAX_V / Math.sqrt(sSq);
+            body.vx *= f; body.vy *= f;
+        }
+        body.x += body.vx * gameDt;
+        body.y += body.vy * gameDt;
+
+        if (body.isPlayer) {
+            const px = (body.x - camera.x) * camera.scale + canvas.width / 2;
+            const py = (body.y - camera.y) * camera.scale + canvas.height / 2;
+            body.angle = Math.atan2(screenMouseY - py, screenMouseX - px);
+        }
+    }
+
+    // --- Collisions ---
+    checkCollisions(dt);
+    if (playerNeedsReset) { resetPlayer(); return; }
+
+    // --- Sun Absorption ---
+    checkSunAbsorption(dt);
+
+    // --- Orbit Parameters ---
+    const effectiveCenter = sun || (gameWon ? player : null);
+    if (effectiveCenter) {
+        const proxPlayer = celestialBodies.find(b => b.isPlayer);
+        const maxDistSq = proxPlayer
+            ? Math.pow(proxPlayer.radius * 1.25 * TRAIL_PROXIMITY_FACTOR, 2)
+            : -1;
+
+        for (let body of celestialBodies) {
+            if (!body || body === effectiveCenter || body.isSpark || body.mass <= 0) continue;
+            if (body === proxPlayer && effectiveCenter === proxPlayer) continue;
+
+            if (body.radius * camera.scale < MIN_TRAIL_RADIUS_PX && !body.isPlayer) {
+                body.trailOpacity = 0;
+                continue;
+            }
+
+            const params = calculateOrbitParameters(body, effectiveCenter);
+            body.orbitA = params.a;
+            body.orbitB = params.b;
+            body.orbitE = params.e;
+            body.orbitPeriapsisAngle = params.periapsisAngle;
+            body.orbitCollidesCenter = params.collidesCenter;
+
+            if (!body.isPlayer) {
+                let targetOp = 0;
+                if (proxPlayer && maxDistSq > 0) {
+                    const dx = body.x - proxPlayer.x, dy = body.y - proxPlayer.y;
+                    if (dx*dx + dy*dy <= maxDistSq) targetOp = 1;
+                }
+                const rate = (targetOp > body.trailOpacity) ? TRAIL_FADE_IN_RATE : TRAIL_FADE_OUT_RATE;
+                if (targetOp > body.trailOpacity) body.trailOpacity = Math.min(targetOp, body.trailOpacity + rate * dt);
+                else body.trailOpacity = Math.max(targetOp, body.trailOpacity - rate * dt);
+                body.trailOpacity = Math.max(0, Math.min(1, body.trailOpacity));
+            }
+        }
+    }
+
+    // Camera
+    if (player) { camera.x = player.x; camera.y = player.y; }
+
+    // Warning
+    const tw = calculateWarningIntensity();
+    currentWarningIntensity += (tw - currentWarningIntensity) * 5 * dt;
+    currentWarningIntensity = Math.max(0, Math.min(1, currentWarningIntensity));
+
+    updateOrbitHistory();
+    decayEjectionMultiplier();
+}
+
+// ============================================================
+// COLLISIONS
+// ============================================================
+function checkCollisions(dt) {
+    const now = Date.now();
+    for (let i = celestialBodies.length - 1; i >= 0; i--) {
+        const b1 = celestialBodies[i];
+        if (!b1) continue;
+        for (let j = i - 1; j >= 0; j--) {
+            const b2 = celestialBodies[j];
+            if (!b2) continue;
+
+            const age1 = now - b1.creationTime, age2 = now - b2.creationTime;
+            const n1 = !b1.isSpark && !b1.isSun && !b1.isPlayer && age1 < EJECTION_COLLISION_DELAY;
+            const n2 = !b2.isSpark && !b2.isSun && !b2.isPlayer && age2 < EJECTION_COLLISION_DELAY;
+
+            if ((b1.isPlayer && b2.isSpark) || (b2.isPlayer && b1.isSpark)) continue;
+            if (b1.isSpark && b2.isSpark) continue;
+            if ((b1.isPlayer && n2) || (b2.isPlayer && n1)) continue;
+            if ((b1.isSpark && n2) || (b2.isSpark && n1)) continue;
+            if (n1 && n2) continue;
+            if ((b1.isSpark && !b2.isSpark && !b2.isPlayer && !b2.isGravitationalCenter) ||
+                (b2.isSpark && !b1.isSpark && !b1.isPlayer && !b1.isGravitationalCenter)) continue;
+            if ((b1.isPlayer && b2.isSun) || (b2.isPlayer && b1.isSun)) continue;
+
+            const dx = b2.x - b1.x, dy = b2.y - b1.y;
+            const distSq = dx * dx + dy * dy;
+            const cr = b1.radius + b2.radius;
+            if (distSq >= cr * cr) continue;
+
+            collisionDetectedThisFrame = true;
+            let big, small, bigI, smallI;
+            if (b1.mass >= b2.mass) { big = b1; bigI = i; small = b2; smallI = j; }
+            else { big = b2; bigI = j; small = b1; smallI = i; }
+
+            if (small.isGravitationalCenter || big.isSpark) continue;
+
+            let transfer = small.isSpark ? small.mass
+                : Math.min(small.mass, small.mass * MASS_TRANSFER_PERCENT_PER_SEC * dt);
+            transfer = Math.max(0, transfer);
+
+            if (big.isPlayer && transfer > 0) {
+                const total = big.mass + transfer;
+                if (total > 1e-9) {
+                    big.vx = (big.mass * big.vx + transfer * small.vx) / total;
+                    big.vy = (big.mass * big.vy + transfer * small.vy) / total;
+                }
+            }
+
+            big.mass += transfer;
+            small.mass -= transfer;
+
+            if (small.isPlayer && small.mass < MIN_PLAYER_MASS) { playerNeedsReset = true; return; }
+
+            if (small.mass <= MIN_BODY_MASS || (small.isSpark && transfer >= small.mass * 0.99)) {
+                small.trailOpacity = 0;
+                celestialBodies.splice(smallI, 1);
+                if (bigI > smallI) bigI--;
+                i = bigI;
+                break;
+            }
+        }
+        if (playerNeedsReset) return;
+    }
+}
+
+// ============================================================
+// SUN ABSORPTION
+// ============================================================
+function checkSunAbsorption(dt) {
+    if (gameWon) return;
+
+    const player = celestialBodies.find(b => b.isPlayer);
+    const sun = celestialBodies.find(b => b.isSun);
+    if (!player || !sun) return;
+
+    const gameDt = dt * currentGameSpeed;
+
+    // Player mass ratio relative to SUN_GAME_MASS (the reachable one!)
+    const massRatio = player.mass / SUN_GAME_MASS;
+    const canAbsorb = massRatio >= SUN_ABSORPTION_START_RATIO;
+
+    // Distance check
+    const dx = sun.x - player.x, dy = sun.y - player.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const touchDist = player.radius + sun.radius;
+    const absorptionRange = touchDist * SUN_ABSORPTION_RANGE_MULTIPLIER;
+
+    // Death collision if too small
+    if (!canAbsorb) {
+        if (dist < touchDist * 0.8) {
+            console.log("Player hit the sun while too small! Resetting.");
+            playerNeedsReset = true;
+        }
+        gravityBlendFactor = Math.max(0, gravityBlendFactor - 0.5 * dt);
+        return;
+    }
+
+    // Not in range yet
+    if (dist > absorptionRange) {
+        gravityBlendFactor = Math.max(0, gravityBlendFactor - 0.3 * dt);
+        return;
+    }
+
+    // --- ABSORBING! ---
+    const proximity = Math.max(0, Math.min(1, 1 - (dist - touchDist * 0.5) / (absorptionRange - touchDist * 0.5)));
+    const advantage = Math.min(2, (massRatio - SUN_ABSORPTION_START_RATIO) / (1 - SUN_ABSORPTION_START_RATIO));
+    const rate = SUN_ABSORPTION_RATE * proximity * Math.max(0.2, advantage);
+
+    // Transfer game-mass from sun to player
+    let transfer = sunCurrentGameMass * rate * gameDt;
+    transfer = Math.min(transfer, sunCurrentGameMass);
+    transfer = Math.max(0, transfer);
+    if (transfer <= 0) return;
+
+    // Momentum conservation
+    const totalAfter = player.mass + transfer;
+    if (totalAfter > 1e-9) {
+        player.vx = (player.mass * player.vx + transfer * sun.vx) / totalAfter;
+        player.vy = (player.mass * player.vy + transfer * sun.vy) / totalAfter;
+    }
+
+    // Apply transfer
+    player.mass += transfer;
+    sunCurrentGameMass -= transfer;
+    sun.mass = sunCurrentGameMass; // Keep sun's actual mass in sync with game mass
+
+    // Update progress & gravity blend
+    sunAbsorptionProgress = 1 - (sunCurrentGameMass / SUN_GAME_MASS);
+    gravityBlendFactor = Math.min(1, sunAbsorptionProgress);
+
+    // Win check
+    if (sunCurrentGameMass < SUN_GAME_MASS * 0.02) {
+        console.log("=== WIN! Sun absorbed! ===");
+        console.log("Player mass:", player.mass.toExponential(3));
+        gameWon = true;
+        playerIsGravitationalCenter = true;
+        gravityBlendFactor = 1;
+
+        player.mass += sunCurrentGameMass;
+        sunCurrentGameMass = 0;
+        player.isGravitationalCenter = true;
+
+        const sunIdx = celestialBodies.indexOf(sun);
+        if (sunIdx !== -1) celestialBodies.splice(sunIdx, 1);
+
+        celestialBodies.forEach(b => { if (b !== player) b.isGravitationalCenter = false; });
+        orbitHistory = [];
+    }
+}
+
+// ============================================================
+// ORBIT PARAMETERS
+// ============================================================
+function calculateOrbitParameters(body, center) {
+    if (!center || body.mass <= 0 || body.isSpark || body === center)
+        return { a: 0, b: 0, e: 0, periapsisAngle: 0, collidesCenter: false };
+
+    const rx = body.x - center.x, ry = body.y - center.y;
+    const r = Math.sqrt(rx * rx + ry * ry + 1e-9);
+    const vx = body.vx - center.vx, vy = body.vy - center.vy;
+    const vSq = vx * vx + vy * vy;
+    const rdotv = rx * vx + ry * vy;
+
+    // Effective mu: use the blended gravitational mass
+    let effectiveGravMass;
+    if (center.isSun) {
+        effectiveGravMass = SUN_GRAVITATIONAL_MASS * (1 - gravityBlendFactor);
+        // Add player's gravitational contribution if blending
+        const pl = celestialBodies.find(b => b.isPlayer);
+        if (pl && gravityBlendFactor > 0) {
+            effectiveGravMass += pl.mass * GRAVITY_CROSSOVER_MULTIPLIER * gravityBlendFactor;
+        }
+    } else if (center.isPlayer && center.isGravitationalCenter) {
+        effectiveGravMass = center.mass * GRAVITY_CROSSOVER_MULTIPLIER;
+    } else {
+        effectiveGravMass = center.mass;
+    }
+
+    const mu = G * (effectiveGravMass + body.mass);
+    const E = vSq / 2 - mu / r;
+    if (E >= -1e-9 || !isFinite(E))
+        return { a: Infinity, b: Infinity, e: 1, periapsisAngle: 0, collidesCenter: false };
+
+    const a = -mu / (2 * E);
+    if (!isFinite(a) || a <= 0)
+        return { a: Infinity, b: Infinity, e: 1, periapsisAngle: 0, collidesCenter: false };
+
+    const h = rx * vy - ry * vx;
+    const eSq = 1 + (2 * E * h * h) / (mu * mu);
+    const e = eSq > 1e-9 ? Math.sqrt(eSq) : 0;
+    const b = a * Math.sqrt(Math.max(0, 1 - e * e));
+
+    const muInv = 1/mu, rInv = 1/r;
+    const fac = vSq * muInv - rInv;
+    const ex = fac * rx - rdotv * vx * muInv;
+    const ey = fac * ry - rdotv * vy * muInv;
+    const periapsisAngle = Math.atan2(ey, ex);
+    const collidesCenter = a * (1 - e) <= (center.radius + body.radius);
+
+    return { a, b, e, periapsisAngle, collidesCenter };
+}
+
+// ============================================================
+// RESET
+// ============================================================
+function resetPlayer() {
+    console.log("Resetting player...");
+    let sun = celestialBodies.find(b => b.isSun);
+    if (!sun) {
+        sun = new CelestialBody(0, 0, 0, 0, SUN_GAME_MASS, false, true);
+        celestialBodies.push(sun);
+    } else {
+        sun.isGravitationalCenter = true;
+        sun.mass = SUN_GAME_MASS;
+    }
+    sunCurrentGameMass = SUN_GAME_MASS;
+
+    const orbitR = Math.max(sun.radius * 1.5, Math.min(canvas.width, canvas.height) * 0.35);
+    const orbSpeed = Math.sqrt((G * SUN_GRAVITATIONAL_MASS) / orbitR);
+
+    celestialBodies = [sun];
+    const p = new CelestialBody(sun.x, sun.y - orbitR, sun.vx + orbSpeed, sun.vy, PLAYER_INITIAL_MASS, true);
+    p.isGravitationalCenter = false;
+    celestialBodies.push(p);
+
+    gameWon = false;
+    playerIsGravitationalCenter = false;
+    sunAbsorptionProgress = 0;
+    gravityBlendFactor = 0;
+    sun.isGravitationalCenter = true;
+
+    populateSystem(INIT_NUM_BODIES);
+
+    orbitHistory = [];
+    currentEjectionMultiplier = 1;
+    lastClickTime = lastEjectionDecayTime = 0;
+    currentWarningIntensity = 0;
+    camera = { x: p.x, y: p.y, scale: 1 };
+    playerNeedsReset = false;
+}
+
+// ============================================================
+// WARNING INTENSITY
+// ============================================================
+function calculateWarningIntensity() {
+    const player = celestialBodies.find(b => b.isPlayer);
+    if (!player || gameWon || sunAbsorptionProgress > 0) return 0;
+    const range = PLAYER_INITIAL_MASS - MIN_PLAYER_MASS;
+    if (range <= 0) return 0;
+    const ratio = (player.mass - MIN_PLAYER_MASS) / range;
+    if (ratio > 0.5) return 0;
+    return Math.max(0, Math.min(1, 1 - ratio / 0.5));
+}
+
+// ============================================================
+// ORBIT HISTORY
+// ============================================================
+function updateOrbitHistory() {
+    const player = celestialBodies.find(b => b.isPlayer);
+    const sun = celestialBodies.find(b => b.isSun);
+    const center = sun || (gameWon ? null : null);
+
+    if (player && center && player !== center) {
+        const p = calculateOrbitParameters(player, center);
+        if (isFinite(p.a) && p.a > 0 && isFinite(p.b) && p.b > 0) {
+            p.absorbing = sunAbsorptionProgress > 0;
+            p.absorptionProgress = sunAbsorptionProgress;
+            orbitHistory.unshift(p);
+            if (orbitHistory.length > ORBIT_HISTORY_LENGTH) orbitHistory.pop();
+        }
+    } else {
+        orbitHistory = [];
+    }
+}
+
+// ============================================================
+// DRAWING
+// ============================================================
+function drawEllipse(ctx, cx, cy, a, b, e, pa) {
+    if (!isFinite(a) || !isFinite(b) || a <= 0 || b <= 0 || !isFinite(e) || !isFinite(pa)) return false;
+    ctx.save();
+    const sx = (cx - camera.x) * camera.scale + canvas.width / 2;
+    const sy = (cy - camera.y) * camera.scale + canvas.height / 2;
+    ctx.translate(sx, sy); ctx.rotate(pa);
+    const sa = a * camera.scale, sb = b * camera.scale, sf = sa * e;
+    const maxD = Math.max(canvas.width, canvas.height) * 15;
+    if (sa > maxD || sb > maxD || sa < 0.1 || sb < 0.1) { ctx.restore(); return false; }
+    ctx.beginPath();
+    try { ctx.ellipse(-sf, 0, sa, sb, 0, 0, 2 * Math.PI); }
+    catch(e) { ctx.restore(); return false; }
+    ctx.restore();
+    return true;
+}
+
+function drawCrosshair() {
+    const player = celestialBodies.find(b => b.isPlayer);
+    if (!player) return;
+    const px = (player.x - camera.x) * camera.scale + canvas.width / 2;
+    const py = (player.y - camera.y) * camera.scale + canvas.height / 2;
+    const ang = Math.atan2(screenMouseY - py, screenMouseX - px);
+    ctx.save();
+    ctx.translate(screenMouseX, screenMouseY);
+    ctx.rotate(ang + Math.PI / 2);
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 4; i++) {
+        ctx.rotate(Math.PI / 2);
+        ctx.beginPath(); ctx.moveTo(5, 0);
+        const len = (i === 0) ? CROSSHAIR_LONG_LINE : CROSSHAIR_SIZE / 2.5;
+        const g = ctx.createLinearGradient(5, 0, len, 0);
+        g.addColorStop(0, 'rgba(255,255,255,1)');
+        g.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.strokeStyle = g;
+        ctx.lineTo(len, 0); ctx.stroke();
+    }
+    ctx.restore();
+}
+
+function drawOrbitHistory() {
+    const sun = celestialBodies.find(b => b.isSun);
+    const center = sun || (gameWon ? celestialBodies.find(b => b.isPlayer && b.isGravitationalCenter) : null);
+    if (!center || orbitHistory.length === 0) return;
+
+    ctx.save(); ctx.lineWidth = 1;
+    orbitHistory.forEach((o, idx) => {
+        if (!o || !isFinite(o.a) || o.a <= 0 || !isFinite(o.b) || o.b <= 0) return;
+        const alpha = 0.1 * (ORBIT_HISTORY_LENGTH - idx) / ORBIT_HISTORY_LENGTH;
+        let color;
+        if (o.absorbing) {
+            const p = o.absorptionProgress || 0;
+            color = `rgba(${Math.round(50*(1-p))}, ${Math.round(150+105*p)}, 255, ${alpha*(1+p)})`;
+        } else if (o.collidesCenter) {
+            color = `rgba(255, 0, 0, ${alpha})`;
+        } else {
+            color = `rgba(173, 216, 230, ${alpha})`;
+        }
+        if (drawEllipse(ctx, center.x, center.y, o.a, o.b, o.e, o.periapsisAngle)) {
+            ctx.strokeStyle = color;
+            ctx.stroke();
+        }
+    });
+    ctx.restore();
+}
+
+function draw() {
+    ctx.fillStyle = 'black';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    drawOrbitHistory();
+
+    // Mass orbit trails
+    ctx.save(); ctx.lineWidth = 1.5;
+    const sun = celestialBodies.find(b => b.isSun);
+    const tc = sun || (gameWon ? celestialBodies.find(b => b.isGravitationalCenter) : null);
+    if (tc) {
+        for (const body of celestialBodies) {
+            if (!body || body.isPlayer || body.isSpark || body === tc || body.mass < MIN_BODY_MASS
+                || body.trailOpacity <= 0 || !isFinite(body.orbitA) || body.orbitA <= 0
+                || !isFinite(body.orbitB) || body.orbitB <= 0) continue;
+            if (body.orbitA * camera.scale < 1 || body.orbitB * camera.scale < 1) continue;
+            ctx.strokeStyle = `rgba(100,100,100,${0.38 * body.trailOpacity})`;
+            if (drawEllipse(ctx, tc.x, tc.y, body.orbitA, body.orbitB, body.orbitE, body.orbitPeriapsisAngle))
+                ctx.stroke();
+        }
+    }
+    ctx.restore();
+
+    // Bodies
+    const valid = celestialBodies.filter(b => b && (b.mass > MIN_BODY_MASS || b.isPlayer || b.isSun || b.isSpark));
+    valid.sort((a, b) => {
+        if (a.isGravitationalCenter) return -1;
+        if (b.isGravitationalCenter) return 1;
+        if (a.isPlayer) return 1;
+        if (b.isPlayer) return -1;
+        return a.mass - b.mass;
+    });
+
+    const now = Date.now();
+    for (const body of valid) {
+        const sx = (body.x - camera.x) * camera.scale + canvas.width / 2;
+        const sy = (body.y - camera.y) * camera.scale + canvas.height / 2;
+        let sr = body.radius * camera.scale;
+        if (sx + sr*2 < 0 || sx - sr*2 > canvas.width || sy + sr*2 < 0 || sy - sr*2 > canvas.height) continue;
+        sr = body.isSpark ? Math.max(SPARK_MIN_DRAW_RADIUS, sr) : Math.max(0.5, sr);
+
+        let fill = 'white';
+
+        if (body.isSun) {
+            if (sunAbsorptionProgress > 0) {
+                const p = sunAbsorptionProgress;
+                fill = `rgba(255, ${Math.round(255*(1-p*0.7))}, ${Math.round(60*(1-p))}, ${0.4+0.6*(1-p)})`;
+            } else fill = 'yellow';
+        } else if (body.isPlayer && body.isGravitationalCenter) {
+            fill = 'gold';
+        } else if (body.isPlayer) {
+            if (sunAbsorptionProgress > 0) {
+                const p = sunAbsorptionProgress;
+                fill = `rgb(${Math.round(180+75*(1-p))}, ${Math.round(220+35*p)}, 255)`;
+                // Glow
+                const gr = sr * (1.5 + p * 1.5);
+                const grd = ctx.createRadialGradient(sx, sy, sr, sx, sy, gr);
+                grd.addColorStop(0, `rgba(100,180,255,${0.25*p})`);
+                grd.addColorStop(1, 'rgba(100,180,255,0)');
+                ctx.fillStyle = grd;
+                ctx.beginPath(); ctx.arc(sx, sy, gr, 0, Math.PI*2); ctx.fill();
+            } else {
+                const w = currentWarningIntensity;
+                fill = `rgb(${Math.round(255*(1-w*0.35))}, ${Math.round(255*(1-w))}, ${Math.round(255*(1-w))})`;
+            }
+        } else if (body.isSpark) {
+            const f = Math.min(1, Math.max(0, (now - body.creationTime) / SPARK_LIFESPAN));
+            const a = 1 - f*f;
+            let r=255, g=255, b=255;
+            if (f < 0.25) b = Math.round(255*(1-f/0.25));
+            else if (f < 0.5) { b=0; g = Math.round(255-90*((f-0.25)/0.25)); }
+            else if (f < 0.75) { b=0; g = Math.round(165*(1-(f-0.5)/0.25)); }
+            else { b=0; g=0; r = Math.round(255-116*((f-0.75)/0.25)); }
+            fill = `rgba(${r},${g},${b},${a})`;
+        } else {
+            fill = 'rgba(255,255,255,0.6)';
+        }
+
+        ctx.fillStyle = fill;
+        ctx.beginPath(); ctx.arc(sx, sy, sr, 0, Math.PI*2); ctx.fill();
+
+        // Sun corona
+        if (body.isSun && sr > 3) {
+            const cr = sr * 1.3;
+            const cg = ctx.createRadialGradient(sx, sy, sr*0.9, sx, sy, cr);
+            cg.addColorStop(0, `rgba(255,200,50,${0.15*(1-sunAbsorptionProgress)})`);
+            cg.addColorStop(1, 'rgba(255,100,0,0)');
+            ctx.fillStyle = cg;
+            ctx.beginPath(); ctx.arc(sx, sy, cr, 0, Math.PI*2); ctx.fill();
+        }
+
+        // Player direction
+        if (body.isPlayer) {
+            ctx.strokeStyle = sunAbsorptionProgress > 0 ? 'rgba(100,200,255,0.8)'
+                            : body.isGravitationalCenter ? 'gold' : 'red';
+            ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(sx, sy);
+            ctx.lineTo(sx + Math.cos(body.angle)*sr*1.4, sy + Math.sin(body.angle)*sr*1.4);
+            ctx.stroke();
+        }
+    }
+
+    // UI
+    drawCrosshair();
+
+    // Warning
+    if (currentWarningIntensity > 0.75 && !gameWon && sunAbsorptionProgress <= 0) {
+        ctx.fillStyle = `rgba(255,0,0,${currentWarningIntensity})`;
+        ctx.font = '24px Arial'; ctx.textAlign = 'center';
+        ctx.fillText('KRITISCHE MASSE!', canvas.width/2, 30);
+    }
+
+    // Absorption UI
+    if (sunAbsorptionProgress > 0 && !gameWon) {
+        const pulse = 0.7 + 0.3 * Math.sin(now/400);
+        ctx.fillStyle = `rgba(100,200,255,${pulse*0.8})`;
+        ctx.font = '20px Arial'; ctx.textAlign = 'center';
+        if (sunAbsorptionProgress < 0.3) ctx.fillText('Die Sonne wird schwächer...', canvas.width/2, 35);
+        else if (sunAbsorptionProgress < 0.7) ctx.fillText('Du wirst zum neuen Zentrum!', canvas.width/2, 35);
+        else ctx.fillText('Fast geschafft!', canvas.width/2, 35);
+
+        const bW=200, bH=8, bX=canvas.width/2-100, bY=canvas.height-50;
+        ctx.fillStyle = 'rgba(50,50,50,0.7)';
+        ctx.fillRect(bX, bY, bW, bH);
+        const gr = ctx.createLinearGradient(bX, bY, bX+bW*sunAbsorptionProgress, bY);
+        gr.addColorStop(0, 'rgba(80,160,255,0.9)');
+        gr.addColorStop(1, 'rgba(150,220,255,0.9)');
+        ctx.fillStyle = gr;
+        ctx.fillRect(bX, bY, bW*sunAbsorptionProgress, bH);
+        ctx.fillStyle = 'rgba(150,210,255,0.7)';
+        ctx.font = '12px Arial';
+        ctx.fillText(`Sonne: ${Math.round((1-sunAbsorptionProgress)*100)}%`, canvas.width/2, bY-6);
+    }
+
+    // Win
+    if (gameWon) {
+        const pulse = 0.7 + 0.3 * Math.sin(now/500);
+        ctx.fillStyle = `rgba(255,215,0,${pulse})`;
+        ctx.font = '48px Arial'; ctx.textAlign = 'center';
+        ctx.fillText('GEWONNEN!', canvas.width/2, canvas.height/2-20);
+        ctx.fillStyle = `rgba(255,215,0,${pulse*0.7})`;
+        ctx.font = '20px Arial';
+        ctx.fillText('Du bist das neue Zentrum des Systems!', canvas.width/2, canvas.height/2+20);
+    }
+
+    // HUD
+    const player = celestialBodies.find(b => b.isPlayer);
+    if (player) {
+        ctx.fillStyle = 'rgba(255,255,255,0.4)';
+        ctx.font = '11px monospace'; ctx.textAlign = 'left';
+        const count = celestialBodies.filter(b => !b.isSpark).length;
+        const massPercent = (player.mass / SUN_GAME_MASS * 100);
+
+        ctx.fillText(`Körper: ${count}`, 10, canvas.height-60);
+        ctx.fillText(`Spieler-Radius: ${player.radius.toFixed(1)}`, 10, canvas.height-45);
+
+        if (!gameWon) {
+            // Show % of game mass (reachable!)
+            ctx.fillText(`Masse: ${massPercent.toFixed(1)}% der Sonne`, 10, canvas.height-30);
+
+            // Show threshold hint
+            if (massPercent < SUN_ABSORPTION_START_RATIO * 100) {
+                ctx.fillStyle = 'rgba(255,150,50,0.5)';
+                ctx.fillText(`Ziel: ${(SUN_ABSORPTION_START_RATIO*100).toFixed(0)}% → Sonne absorbieren`, 10, canvas.height-15);
+            } else {
+                ctx.fillStyle = 'rgba(100,200,255,0.6)';
+                ctx.fillText(`✦ Bereit die Sonne zu absorbieren!`, 10, canvas.height-15);
+            }
+        } else {
+            ctx.fillText(`Masse: ${player.mass.toExponential(1)}`, 10, canvas.height-30);
+        }
+
+        if (gravityBlendFactor > 0 && gravityBlendFactor < 1) {
+            ctx.fillStyle = 'rgba(100,200,255,0.5)';
+            ctx.fillText(`Gravity-Übergang: ${Math.round(gravityBlendFactor*100)}%`, 10, canvas.height-75);
+        }
+    }
+
+    logBodyChanges();
+}
+
+function logBodyChanges() {
+    const t = performance.now();
+    if (t - lastLogTime < LOG_INTERVAL) return;
+    lastLogTime = t;
+    const s = new Map();
+    celestialBodies.forEach(b => { if (!b) return; s.set(b.id, JSON.stringify({
+        x: b.x.toFixed(2), y: b.y.toFixed(2), mass: b.mass.toExponential(2),
+        radius: b.radius.toFixed(2), isPlayer: b.isPlayer, isSun: b.isSun
+    })); });
+    bodyStates = s;
+}
+
+// ============================================================
+// GAME LOOP
+// ============================================================
+let lastTime = 0, animFrameId = null;
+
+function gameLoop() {
+    animFrameId = requestAnimationFrame(gameLoop);
+    try {
+        const now = performance.now();
+        const dt = Math.min((now - lastTime) / 1000, 0.1);
+        lastTime = now;
+        if (dt <= 0) return;
+        updatePhysics(dt);
+        if (!playerNeedsReset) draw();
+    } catch (e) {
+        console.error("Loop error:", e);
+        if (animFrameId) cancelAnimationFrame(animFrameId);
+        if (ctx) { ctx.fillStyle='red'; ctx.font='16px Arial'; ctx.textAlign='center';
+            ctx.fillText('Fehler! F12.', canvas.width/2, canvas.height/2); }
+    }
+}
+
+// ============================================================
+// START
+// ============================================================
+try {
+    initializeGame();
+    lastTime = performance.now();
+    animFrameId = requestAnimationFrame(gameLoop);
+} catch(e) {
+    console.error("Init:", e);
+    const c = document.getElementById('gameCanvas'), x = c?.getContext('2d');
+    if (x) { x.fillStyle='red'; x.font='16px Arial'; x.textAlign='center';
+        x.fillText('Init-Fehler.', c.width/2, c.height/2); }
+}
+
+</script>
+</body>
+</html>
